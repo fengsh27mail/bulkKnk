@@ -1,0 +1,206 @@
+# ==============================================================================
+# bulkKnk 真实世界终极接驳脚本: GSE241466 本地矩阵 + Ensembl 强力转换
+# ==============================================================================
+rm(list = ls());gc()
+# 0. 准备环境
+library(clusterProfiler)
+library(org.Hs.eg.db)
+devtools::load_all()
+
+# 1. 读取你刚刚上传的本地矩阵
+file_path <- "./../../Desktop/转录组最终代码/GSE241466_Raw_data.txt" # 🚨 如果名字不同，请在这里修改
+expr_raw <- read.table(file_path, header = TRUE, row.names = 1, check.names = FALSE)
+expr_matrix <- as.matrix(expr_raw)
+
+message("\n========================================================")
+message("🛸 启动 bulkKnk 外部数据集 (GSE241466) 真实世界测试")
+message("========================================================\n")
+
+# ------------------------------------------------------------------------------
+# 🚨 核心排雷 1：Ensembl ID 转换为 SYMBOL 
+# ------------------------------------------------------------------------------
+message(">>> [数据清洗] 检测到行名为 Ensembl ID，正在切除版本号并转换为 SYMBOL...")
+# 切除小数点及后面的版本号 (ENSG00000268020.3 -> ENSG00000268020)
+ensembl_ids <- gsub("\\..*$", "", rownames(expr_matrix))
+rownames(expr_matrix) <- ensembl_ids
+
+# 转换 ID (利用 clusterProfiler)
+gene_trans <- bitr(ensembl_ids, fromType = "ENSEMBL", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+
+# 过滤矩阵，剔除无法转换或重复的基因
+gene_trans <- gene_trans[!duplicated(gene_trans$SYMBOL), ]
+expr_matrix <- expr_matrix[gene_trans$ENSEMBL, ]
+rownames(expr_matrix) <- gene_trans$SYMBOL
+message(sprintf(">>> [数据清洗] ID 转换完成！保留了 %d 个具备有效 SYMBOL 的基因。", nrow(expr_matrix)))
+
+# ------------------------------------------------------------------------------
+# 🚨 核心排雷 2：生成调试用的表型标签
+# ------------------------------------------------------------------------------
+message(">>> [数据清洗] 正在根据样本列名分配临床表型...")
+# 作为包的抗压测试，由于没有确切的对应表，我们根据单双数划分模拟两组（Tumor vs Normal）
+pheno_vector <- ifelse(as.numeric(gsub("YSINT", "", colnames(expr_matrix))) %% 2 == 0, "Tumor", "Normal")
+target_group <- "Tumor"
+
+# ------------------------------------------------------------------------------
+# 🚨 核心排雷 3：矩阵方向与死寂基因过滤
+# ------------------------------------------------------------------------------
+expr_matrix <- t(expr_matrix) # 转置为 [行=样本, 列=基因]
+gene_variances <- apply(expr_matrix, 2, var)
+expr_matrix <- expr_matrix[, gene_variances > 0] # 剔除死寂基因防报错
+
+message(sprintf(">>> [接驳成功] 最终矩阵准备就绪: %d 个样本, %d 个有效基因", nrow(expr_matrix), ncol(expr_matrix)))
+
+
+# ==============================================================================
+# 下面全部是标准的 bulkKnk 车间流水线代码 (直接复制粘贴，无需修改)
+# ==============================================================================
+
+# 1. 智能特征筛选 (500 个)
+sub_expr <- select_advanced_features(expr_matrix, n_features = 500)
+
+# ------------------------------------------------------------------------------
+# 🚀 2. 极小样本降级模式 (Bypass WGCNA)
+# ------------------------------------------------------------------------------
+message("\n>>> [极小样本降级模式] 样本量过低，绕过 WGCNA，直接提取核心特征基因...")
+
+# 因为 select_advanced_features 已经帮我们把方差最大、最有代表性的基因排好了
+# 我们直接暴力提取前 100 个核心基因，直接喂给因果网络推断引擎！
+top_100_hubs <- colnames(sub_expr)[1:100]
+
+# 随机选一个（或强制指定一个你感兴趣的）作为干预靶点
+top_target <- top_100_hubs[1] 
+message(sprintf(">>> [系统决断] 锁定致病网络！即将对核心 Hub 基因 [%s] 执行虚拟干预！", top_target))
+
+# ------------------------------------------------------------------------------
+# 往下继续无缝衔接你的 Step 3 (因果网络推断)
+# ------------------------------------------------------------------------------
+# focus_mat <- as.matrix(sub_expr[, top_100_hubs, drop = FALSE])
+# net_raw <- infer_causal_network(focus_mat)
+# ...
+# 3. 因果网络推断
+focus_mat <- as.matrix(sub_expr[, top_100_hubs, drop = FALSE])
+net_raw <- infer_causal_network(focus_mat)
+net_clean <- prune_network_dpi_fast(net_raw$clean_matrix, dpi_threshold = 0.5)
+
+rownames(net_clean) <- colnames(focus_mat)
+colnames(net_clean) <- colnames(focus_mat)
+W_norm <- sweep(t(net_clean), 2, colSums(t(net_clean)) + 1e-9, FUN="/")
+
+# 4. 批量虚拟敲除
+ko_results <- batch_virtual_knockout(
+  expr_matrix  = focus_mat, 
+  pheno_vec    = pheno_vector,
+  target_pheno = target_group, 
+  target_genes = top_target, 
+  adj_matrix   = W_norm,
+  method       = "shift" 
+)
+
+# 5. AI 表型预测与出图
+baseline_labels <- ifelse(ko_results$WT[, top_target] > median(ko_results$WT[, top_target]), 
+                          "HighRisk", "LowRisk")
+
+report <- predict_ko_phenotype(
+  WT_matrix    = t(ko_results$WT), 
+  KO_matrix    = t(ko_results$KO), 
+  pheno_labels = baseline_labels, 
+  target_pheno = "HighRisk",
+  ko_gene      = top_target
+)
+
+p <- plot_ko_delta(report, color_by = "direction")
+print(p)
+
+
+
+
+
+
+
+
+# ==============================================================================
+# 🎨 bulkKnk 终极可视化全家桶 (Visual Grand Slam)
+# 前提：假设你已经跑完了 batch_virtual_knockout 并得到了 ko_results
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 🔓 解锁层 4：伪造一份临床生存数据 (真实分析时请换成你自己的 clinical_data)
+# ------------------------------------------------------------------------------
+set.seed(2026)
+clinical_mock <- data.frame(
+  sample_id = rownames(ko_results$WT),
+  OS_time   = round(runif(nrow(ko_results$WT), 1, 60), 1),  # 模拟 1~60 个月的生存时间
+  OS_status = sample(c(0, 1), nrow(ko_results$WT), replace = TRUE, prob = c(0.3, 0.7)) # 1=死亡, 0=截尾
+)
+
+# ------------------------------------------------------------------------------
+# 🚀 重新运行全功率版 AI 评估 (挂载生存数据)
+# ------------------------------------------------------------------------------
+message("\n>>> 正在挂载临床数据，执行全功率 AI 评估（解锁生存模块）...")
+baseline_labels <- ifelse(ko_results$WT[, top_target] > median(ko_results$WT[, top_target]), 
+                          "HighRisk", "LowRisk")
+
+report <- predict_ko_phenotype(
+  WT_matrix     = t(ko_results$WT), 
+  KO_matrix     = t(ko_results$KO), 
+  pheno_labels  = baseline_labels, 
+  target_pheno  = "HighRisk",
+  ko_gene       = top_target,
+  clinical_data = clinical_mock, # 🚨 核心参数：传入临床数据！
+  time_unit     = "month"
+)
+
+# ------------------------------------------------------------------------------
+# 🎇 召唤 6 大神图
+# ------------------------------------------------------------------------------
+message("\n==============================================")
+message("🎨 开始渲染 bulkKnk 6 大神图...")
+message("==============================================\n")
+
+# 【图 1】AI 签名偏移条形图 (Signature Shift Barplot)
+message(">> 正在绘制 图1: 签名偏移图...")
+p1 <- plot_ko_delta(report, top_n = 15, color_by = "category")
+print(p1)
+
+# 【图 2】真实与虚拟双重火山图 (Dual Volcano)
+message(">> 正在绘制 图2: 虚拟敲除火山图...")
+p2 <- plot_dual_volcano(
+  real_deg_df  = NULL, 
+  WT_matrix    = ko_results$WT, 
+  KO_matrix    = ko_results$KO, 
+  target_genes = top_target
+)
+print(p2)
+
+# 【图 3】GO 级联富集气泡图 (Enrichment Dotplot)
+message(">> 正在绘制 图3: 级联通路 GO 富集图...")
+wt_mean <- colMeans(ko_results$WT)
+ko_mean <- colMeans(ko_results$KO)
+log2fc <- log2((ko_mean + 0.1) / (wt_mean + 0.1))
+# 挑选被敲除波及（变化 > 0.05）的下游基因
+virtual_degs <- setdiff(names(log2fc)[abs(log2fc) > 0.05], top_target)
+
+if(length(virtual_degs) > 0) {
+  go_res <- run_vk_enrichment(virtual_degs, species = "human", database = "GO")
+  if(!is.null(go_res) && nrow(go_res) > 0) {
+    p3 <- clusterProfiler::dotplot(go_res, title = paste("GO Enrichment after", top_target, "KO"))
+    print(p3)
+  }
+}
+
+# 【图 4】风险评分漂移密度图 (Risk Score Shift)
+message(">> 正在绘制 图4: 风险评分漂移密度图...")
+p4 <- plot_risk_score_shift(report)
+print(p4)
+
+# 【图 5】预后签名 Cox 森林图 (Prognostic Forest)
+message(">> 正在绘制 图5: 预后特征 Cox 森林图...")
+p5 <- plot_cox_forest(report, top_n = 10)
+print(p5)
+
+# 【图 6】虚拟生存获益 KM 曲线对比 (KM Survival Comparison)
+message(">> 正在绘制 图6: 虚拟敲除 KM 生存对比图...")
+p6 <- plot_km_comparison(report, show_table = TRUE)
+print(p6)
+
+message("🎉 6 大神图渲染完毕！请在右下角 Plots 面板使用左右箭头依次查看！")

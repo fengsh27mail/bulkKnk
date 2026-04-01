@@ -1,0 +1,31 @@
+# 1. 召唤真实数据
+data("tcga_stad_mini")
+WT_mat <- tcga_stad_mini$expr_matrix
+pheno_df <- tcga_stad_mini$pheno_data
+
+# 2. 从真实的 TCGA 胃癌转录组中提纯出网络拓扑
+message("\n[Step 1: Network Inference]")
+net_res <- infer_causal_network(expr_matrix = WT_mat, threshold_method = "top_quantile", q_val = 0.90)
+W_norm <- sweep(t(net_res$clean_matrix), 2, colSums(t(net_res$clean_matrix)) + 1e-9, FUN="/")
+
+# 3. 批量生成 60 个病人的虚拟敲除表达谱 (极其硬核的矩阵运算)
+# 我们模拟联合敲除 CD274 (PD-L1) 和 MYC (经典致癌/免疫抑制枢纽)
+message("\n[Step 2: Virtual Knockout on Cohort]")
+
+# 【修复Bug】：使用 MARGIN = 1 按行(病人)循环，并在外面加上 t() 将矩阵转置回原本的 [样本 x 基因] 维度
+KO_mat <- t(apply(WT_mat, 1, function(patient_expr) {
+  run_virtual_knockout(target_genes = c("CD274", "MYC"), E_init = patient_expr, adj_matrix = W_norm)
+}))
+
+# 确保行列名称完美对齐
+rownames(KO_mat) <- rownames(WT_mat)
+colnames(KO_mat) <- colnames(WT_mat)
+
+# 4. 召唤 AI 进行疗效预测！
+message("\n[Step 3: AI Phenotype Prediction]")
+ai_report <- predict_ko_phenotype(
+  WT_matrix = WT_mat, 
+  KO_matrix = KO_mat, 
+  pheno_labels = pheno_df$SampleType, 
+  target_pheno = "Tumor"
+)

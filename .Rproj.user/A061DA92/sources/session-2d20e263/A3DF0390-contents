@@ -1,0 +1,80 @@
+#' 自动 WGCNA 模块识别与 Hub 基因提取 (Module 0)
+#'
+#' @param expr_matrix 矩阵。行为样本，列为基因。
+#' @param trait_vec 向量。样本的表型数值（如生存时间或免疫得分）。
+#' @param power 数值。软阈值，若为 NULL 则自动计算。
+#'
+#' @return 包含模块成员信息和 Hub 基因的列表。
+#' @import WGCNA
+#' @importFrom reshape2 melt
+#' @export
+identify_hub_modules <- function(expr_matrix, trait_vec, power = NULL) {
+
+  # 1. 检查并开启 WGCNA 线程环境
+  WGCNA::allowWGCNAThreads()
+
+  # 2. 自动筛选软阈值 (如果未指定)
+  if (is.null(power)) {
+    message(">>> [WGCNA] 正在自动计算最佳软阈值 (Power Selection)...")
+    sft <- WGCNA::pickSoftThreshold(expr_matrix, powerVector = 1:20, verbose = 0)
+    power <- sft$powerEstimate
+    # 兜底：如果无法估计 power，根据样本量推荐默认值
+    if (is.na(power)) {
+      warning("软阈值自动估计失败（样本量可能不足，建议 >= 30）。已使用默认值 power=6。请手动检查 sft$fitIndices 确认合理性。")
+      power <- 6
+    }
+  }
+
+  message(paste(">>> [WGCNA] 使用软阈值:", power, "构建共表达网络..."))
+
+  # 3. 构建网络并识别模块 (一键式 blockwiseModules)
+  net <- WGCNA::blockwiseModules(
+    expr_matrix, power = power,
+    TOMType = "unsigned", minModuleSize = 30,
+    mergeCutHeight = 0.25, numericLabels = TRUE,
+    pamRespectsDendro = FALSE, saveTOMs = FALSE, verbose = 0
+  )
+
+  # 4. 提取模块信息
+  moduleLabels <- net$colors
+  MEs <- net$MEs
+
+  # --- 修正后的索引与 Hub 基因提取逻辑 ---
+
+  # 计算所有模块特征向量 (MEs) 与目标表型 (trait) 的相关性 (Pearson)
+  # 注意：trait_vec 必须是数值型
+  moduleTraitCor <- cor(MEs, as.numeric(trait_vec), use = "p")
+
+  # 【修复核心】：找到相关性绝对值最大的模块位置索引
+  best_module_idx <- which.max(abs(moduleTraitCor))
+
+  # 获取该模块的正式列名 (例如 "ME1")
+  best_me_name <- colnames(MEs)[best_module_idx]
+
+  # 提取纯模块标签 (去掉 "ME" 前缀，例如 "1")
+  best_module_label <- gsub("ME", "", best_me_name)
+
+  message(paste(">>> [WGCNA] 鉴定到最相关模块:", best_me_name,
+                "相关系数:", round(moduleTraitCor[best_module_idx], 3)))
+
+  # 匹配基因：net$colors 的名称是基因名，值是模块编号
+  # 因为设置了 numericLabels = TRUE，所以要进行数值转换匹配
+  is_numeric_label <- !is.na(as.numeric(best_module_label))
+
+  if(is_numeric_label) {
+    target_label <- as.numeric(best_module_label)
+    best_genes <- names(moduleLabels)[moduleLabels == target_label]
+  } else {
+    best_genes <- names(moduleLabels)[moduleLabels == best_module_label]
+  }
+
+  # 5. 返回结果包
+  message(paste(">>> [WGCNA] 该模块共包含", length(best_genes), "个核心基因。"))
+
+  return(list(
+    best_genes = best_genes,      # 筛选出的 Hub 基因列表，可直接喂给 Module 1
+    module_labels = moduleLabels, # 所有基因的模块分配
+    MEs = MEs,                    # 模块特征向量
+    best_module = best_me_name    # 最相关模块名称
+  ))
+}

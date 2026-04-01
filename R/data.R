@@ -1,0 +1,13 @@
+#' 胃癌 (TCGA-STAD) 精简测试数据集
+#'
+#' 这是一个从 TCGA-STAD 项目中提取的微型转录组数据集，包含 50 个肿瘤样本和 10 个正常样本。
+#' 主要用于演示 bulkKnk 包的网络推断、虚拟敲除和 AI 表型预测功能。
+#'
+#' @format 包含两个核心元素的列表 (List):
+#' \describe{
+#'   \item{expr_matrix}{数值矩阵。行为样本 (60个)，列为高变基因 (500个)。}
+#'   \item{pheno_data}{数据框。包含样本的临床表型信息，如 SampleType (Tumor/Normal)。}
+#' }
+#' @source \url{https://portal.gdc.cancer.gov/}
+#' @usage data(tcga_stad_mini)
+"tcga_stad_mini"

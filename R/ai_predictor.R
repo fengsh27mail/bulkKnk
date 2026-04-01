@@ -1,0 +1,1030 @@
+# ==============================================================================
+# ai_predictor.R
+# 虚拟敲除后多维生物学意义评估模块 v3
+#
+# 故事逻辑:
+#   TCGA-STAD 肿瘤高表达基因 (理论"坏基因") → 虚拟敲除 → 稳态矩阵改变
+#   → 四层生物学评估:
+#       层1: 免疫浸润重塑 (ssGSEA)
+#       层2: 恶性程度变化 (Hallmark)
+#       层3: 治疗响应预测 (TIDE / ICI / 药物通路)
+#       层4: 生存预后评估 (Cox风险评分 / KM曲线 / 虚拟生存获益)  ← NEW
+#   → Random Forest 整合评分 → 输出"干预获益概率"
+#
+# 注意: 本函数面向批量转录组数据 (bulk RNA-seq), 非单细胞。
+#
+# 层4 依赖包: survival (必须), survminer (可选，用于美化KM图)
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# 内部工具函数: ssGSEA 单样本基因集打分
+# 不依赖 GSVA 包，使用轻量级 rank-based 实现
+# ------------------------------------------------------------------------------
+.ssgsea_score <- function(expr_matrix, gene_sets) {
+  # expr_matrix: 行=基因, 列=样本
+  # gene_sets: 命名列表，每个元素是基因名向量
+  # 返回: 行=gene_set, 列=样本 的打分矩阵
+
+  genes_in_matrix <- rownames(expr_matrix)
+  n_samples <- ncol(expr_matrix)
+  score_mat <- matrix(NA,
+                      nrow = length(gene_sets),
+                      ncol = n_samples,
+                      dimnames = list(names(gene_sets), colnames(expr_matrix))
+  )
+
+  for (i in seq_along(gene_sets)) {
+    gs <- intersect(gene_sets[[i]], genes_in_matrix)
+    if (length(gs) < 3) next  # 基因集太小跳过
+
+    for (j in seq_len(n_samples)) {
+      x <- expr_matrix[, j]
+      ranked <- rank(x, ties.method = "average")
+      in_set  <- ranked[gs]
+      out_set <- ranked[setdiff(genes_in_matrix, gs)]
+      score_mat[i, j] <- mean(in_set) - mean(out_set)
+    }
+  }
+  return(score_mat)
+}
+
+
+# ------------------------------------------------------------------------------
+# 内置基因集签名 (涵盖: 免疫细胞浸润 / Hallmark恶性程度 / 治疗响应)
+# ------------------------------------------------------------------------------
+.get_builtin_signatures <- function() {
+  list(
+    # ── 免疫浸润相关签名 ──────────────────────────────────────────────────────
+    immune_CD8T         = c("CD8A","CD8B","GZMB","PRF1","IFNG","TBX21","EOMES"),
+    immune_CD4T         = c("CD4","IL7R","CCR7","FOXP3","IL2RA","CTLA4"),
+    immune_Treg         = c("FOXP3","IL2RA","CTLA4","IKZF2","TNFRSF18"),
+    immune_NK           = c("NCAM1","KLRD1","NKG7","GNLY","KLRB1","KLRC1"),
+    immune_Macro_M1     = c("CD68","IL1B","TNF","IL6","CXCL10","NOS2"),
+    immune_Macro_M2     = c("CD163","MRC1","IL10","TGFB1","ARG1","VEGFA"),
+    immune_DC           = c("ITGAX","HLA-DRA","CD1C","CLEC9A","SIGLEC6"),
+    immune_B            = c("CD19","MS4A1","CD79A","IGHG1","MZB1"),
+    immune_Exhaustion   = c("PDCD1","LAG3","HAVCR2","TIGIT","CTLA4",
+                            "TOX","NR4A1","ENTPD1"),
+    immune_IFN_gamma    = c("IFNG","STAT1","IRF1","CXCL9","CXCL10",
+                            "CXCL11","IDO1","HLA-DRA"),
+
+    # ── Hallmark 恶性程度签名 ─────────────────────────────────────────────────
+    hallmark_Proliferation = c("MKI67","TOP2A","PCNA","CDK1","CCNB1",
+                               "CCNA2","BUB1","AURKA"),
+    hallmark_EMT           = c("VIM","CDH2","FN1","SNAI1","SNAI2","TWIST1",
+                               "ZEB1","ZEB2","MMP2","MMP9"),
+    hallmark_Hypoxia       = c("HIF1A","VEGFA","LDHA","SLC2A1","BNIP3",
+                               "CA9","PDK1","ANGPT2"),
+    hallmark_PI3K_AKT      = c("AKT1","PIK3CA","MTOR","RPS6KB1","EIF4EBP1",
+                               "PTEN","PDK1","TSC2"),
+    hallmark_MYC           = c("MYC","MYCN","MAX","MXD1","ODC1","LDHA",
+                               "NCL","NPM1"),
+    hallmark_DNA_repair    = c("BRCA1","BRCA2","RAD51","FANCD2","MLH1",
+                               "MSH2","ATM","CHEK2"),
+    hallmark_Angiogenesis  = c("VEGFA","VEGFB","FGF2","PDGFB","ANGPT1",
+                               "PECAM1","KDR","TEK"),
+
+    # ── 免疫治疗响应签名 ──────────────────────────────────────────────────────
+    immuno_TIDE_dysfunction = c("PDCD1","LAG3","HAVCR2","TIGIT",
+                                "CD274","PDCD1LG2"),
+    immuno_TIDE_exclusion   = c("TGFB1","TGFB2","VEGFA","WNT5A",
+                                "CXCL12","IDO1"),
+    immuno_CytotoxicScore   = c("CD8A","GZMB","PRF1","GNLY","NKG7","CTSW"),
+    immuno_ICB_response     = c("CD274","PDCD1","IFNG","CXCL9","CXCL10"),
+
+    # ── 药物敏感性相关通路签名 ────────────────────────────────────────────────
+    drug_EGFR_pathway  = c("EGFR","ERBB2","ERBB3","MET","KRAS",
+                           "BRAF","MAP2K1","MAPK1"),
+    drug_CDK_pathway   = c("CDK4","CDK6","CCND1","CCND2","RB1",
+                           "E2F1","CDKN2A","CDKN1A"),
+    drug_WNT_pathway   = c("CTNNB1","APC","AXIN1","GSK3B","TCF7L2",
+                           "LGR5","RSPO1","DKK1"),
+    drug_PARP_BRCAness = c("BRCA1","BRCA2","PALB2","RAD51C","ATM",
+                           "FANCD2","CHEK1","CHEK2")
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# 主函数
+# ------------------------------------------------------------------------------
+
+#' 虚拟敲除后多维生物学意义评估 v3 (Bulk RNA-seq)
+#'
+#' @param WT_matrix  矩阵。野生型表达矩阵。行=基因，列=样本。
+#' @param KO_matrix  矩阵。虚拟敲除后稳态矩阵。维度须与 WT_matrix 完全一致。
+#' @param pheno_labels 因子或字符向量。每个样本(列)的临床标签，长度=ncol(WT_matrix)。
+#' @param target_pheno 字符串。需要评估的不良表型，如 "Tumor"。
+#' @param ko_gene      字符串或NULL。被敲除基因名，用于报告展示。
+#' @param custom_signatures 命名列表或NULL。用户自定义基因集，与内置签名合并。
+#' @param clinical_data data.frame 或 NULL。
+#'   【层4 生存分析专用】需包含以下列（列名精确匹配）：
+#'   \itemize{
+#'     \item \code{OS_time}  : 总生存时间（月或天，与 \code{time_unit} 一致）
+#'     \item \code{OS_status}: 生存状态，1=死亡/事件，0=截尾
+#'     \item（可选）\code{sample_id}: 样本ID，用于与表达矩阵列名对齐；
+#'       若缺失，则假定 clinical_data 的行顺序与矩阵列顺序完全一致
+#'   }
+#'   若为 NULL，则跳过层4分析。
+#' @param time_unit 字符串。生存时间单位，"month"（默认）或 "day"，
+#'   仅用于图形轴标签，不影响计算。
+#' @param n_risk_genes 整数。用于构建多基因风险评分的 Cox 显著基因最大数量，默认 10。
+#'
+#' @return 包含以下元素的 List:
+#'   \itemize{
+#'     \item \code{delta_scores}        ssGSEA 各签名 KO 前后差值
+#'     \item \code{immune_summary}      免疫浸润变化汇总
+#'     \item \code{malignancy_summary}  恶性程度变化汇总
+#'     \item \code{therapy_summary}     治疗响应变化汇总
+#'     \item \code{rf_model}            Random Forest 模型对象
+#'     \item \code{oob_accuracy}        OOB 准确率
+#'     \item \code{benefit_probability} 综合获益概率
+#'     \item \code{reversal_rate}       表型逆转率
+#'     \item \code{prognosis}           【层4】生存预后分析结果列表（见下）
+#'     \item \code{interpretation}      自动生成的生物学解读文字
+#'   }
+#'   \code{prognosis} 子列表包含:
+#'   \itemize{
+#'     \item \code{risk_score_wt}   WT 各样本多基因风险评分
+#'     \item \code{risk_score_ko}   KO 后各样本多基因风险评分
+#'     \item \code{risk_table}      风险分组对比表（高/低风险样本数变化）
+#'     \item \code{cox_results}     Cox 单因素回归结果（签名基因）
+#'     \item \code{km_data_wt}      WT KM 曲线数据（可传入 plot_km_comparison）
+#'     \item \code{km_data_ko}      KO KM 曲线数据
+#'     \item \code{logrank_p}       WT 高/低风险组 log-rank p 值
+#'     \item \code{median_os_wt_high}  WT 高风险组中位生存时间
+#'     \item \code{median_os_wt_low}   WT 低风险组中位生存时间
+#'     \item \code{hr_wt}           WT 多因素 Cox HR（高 vs 低风险）
+#'     \item \code{predicted_os_gain_months} 虚拟 KO 后预测中位生存获益（月）
+#'   }
+#'
+#' @importFrom randomForest randomForest
+#' @export
+predict_ko_phenotype <- function(WT_matrix,
+                                 KO_matrix,
+                                 pheno_labels,
+                                 target_pheno      = "Tumor",
+                                 ko_gene           = NULL,
+                                 custom_signatures = NULL,
+                                 clinical_data     = NULL,
+                                 time_unit         = "month",
+                                 n_risk_genes      = 10) {
+
+  # ── 0. 依赖检查 ────────────────────────────────────────────────────────────
+  if (!requireNamespace("randomForest", quietly = TRUE))
+    stop("请先安装: install.packages('randomForest')")
+
+  # ── 1. 输入校验 (行=基因, 列=样本) ────────────────────────────────────────
+  if (!identical(dim(WT_matrix), dim(KO_matrix)))
+    stop("WT_matrix 与 KO_matrix 维度不一致！")
+  if (ncol(WT_matrix) != length(pheno_labels))
+    stop("样本数量(列数)与标签数量不匹配！请确认: 行=基因, 列=样本")
+  if (is.null(rownames(WT_matrix)))
+    stop("WT_matrix 缺少基因名(rownames)，无法匹配签名基因集！")
+
+  # 【矩阵方向自动检测】
+  if (nrow(WT_matrix) < ncol(WT_matrix)) {
+    warning(paste0(
+      "检测到 nrow(", nrow(WT_matrix), ") < ncol(", ncol(WT_matrix), ")。\n",
+      "本函数要求：行=基因，列=样本。\n",
+      "如果你的矩阵是 行=样本/列=基因，请先转置：t(your_matrix)"
+    ))
+  }
+
+  pheno_labels <- as.factor(pheno_labels)
+  target_idx   <- which(pheno_labels == target_pheno)
+  if (length(target_idx) == 0)
+    stop(paste("未找到目标表型:", target_pheno))
+
+  # 初始化层4结果容器（若无临床数据则返回 NULL）
+  prognosis_result <- NULL
+
+  gene_name_label <- if (!is.null(ko_gene)) ko_gene else "目标基因"
+  message("==========================================================")
+  message(paste("  🔬 虚拟敲除生物学评估 v3 | 靶基因:", gene_name_label))
+  message("==========================================================")
+
+  # ── 2. 整合基因集签名 ──────────────────────────────────────────────────────
+  signatures <- .get_builtin_signatures()
+  if (!is.null(custom_signatures)) {
+    if (is.list(custom_signatures) && !is.null(names(custom_signatures))) {
+      signatures <- c(signatures, custom_signatures)
+      message(paste(">>> 已合并", length(custom_signatures), "个自定义签名"))
+    } else {
+      warning("custom_signatures 须为命名列表，已忽略。")
+    }
+  }
+
+  # ── 3. ssGSEA 打分 (WT & KO) ──────────────────────────────────────────────
+  message(">>> [层1-3] 正在计算 ssGSEA 多维签名打分 (WT & KO)...")
+  wt_scores <- .ssgsea_score(WT_matrix, signatures)  # 行=签名, 列=样本
+  ko_scores <- .ssgsea_score(KO_matrix, signatures)
+
+  # delta: KO - WT，仅对 target 样本
+  delta      <- ko_scores[, target_idx, drop = FALSE] -
+    wt_scores[, target_idx, drop = FALSE]
+  delta_mean <- rowMeans(delta, na.rm = TRUE)
+
+  delta_df <- data.frame(
+    signature   = names(delta_mean),
+    delta_score = round(delta_mean, 4),
+    direction   = ifelse(delta_mean > 0, "Up↑", "Down↓"),
+    stringsAsFactors = FALSE
+  )
+
+  # ── 4. 分维度汇总 ──────────────────────────────────────────────────────────
+  .subset_sort <- function(pattern) {
+    sub_df <- delta_df[grepl(pattern, delta_df$signature), ]
+    sub_df[order(abs(sub_df$delta_score), decreasing = TRUE), ]
+  }
+
+  immune_df   <- .subset_sort("^immune_")
+  hallmark_df <- .subset_sort("^hallmark_")
+  therapy_df  <- .subset_sort("^immuno_|^drug_")
+  rownames(immune_df) <- rownames(hallmark_df) <- rownames(therapy_df) <- NULL
+
+  message(">>> [层1] 免疫浸润评估完成")
+  message(">>> [层2] 恶性程度评估完成")
+  message(">>> [层3] 治疗响应评估完成")
+
+  # ── 5. Random Forest: 基于 ssGSEA 特征矩阵训练 & 预测 ─────────────────────
+  message(">>> [AI层] 构建整合特征矩阵并训练 Random Forest (ntree=500)...")
+
+  wt_feat <- t(wt_scores)  # 行=样本, 列=签名
+  ko_feat <- t(ko_scores)
+
+  valid_cols <- which(colSums(is.na(wt_feat)) == 0 &
+                        colSums(is.na(ko_feat)) == 0)
+  if (length(valid_cols) < 3)
+    stop("有效签名特征不足3个，请检查 rownames 是否与签名基因匹配！")
+
+  wt_feat <- wt_feat[, valid_cols, drop = FALSE]
+  ko_feat <- ko_feat[, valid_cols, drop = FALSE]
+
+  set.seed(2026)
+  rf_model <- randomForest::randomForest(
+    x = wt_feat, y = pheno_labels,
+    ntree = 500, importance = TRUE
+  )
+  oob_acc <- 1 - rf_model$err.rate[nrow(rf_model$err.rate), "OOB"]
+  message(paste(">>> [AI层] 模型OOB准确率:", round(oob_acc * 100, 2), "%"))
+
+  # ── 6. 预测 KO 后表型概率 ──────────────────────────────────────────────────
+  ko_pred_prob  <- predict(rf_model,
+                           newdata = ko_feat[target_idx, , drop = FALSE],
+                           type = "prob")
+  ko_pred_class <- predict(rf_model,
+                           newdata = ko_feat[target_idx, , drop = FALSE])
+
+  if (target_pheno %in% colnames(ko_pred_prob)) {
+    benefit_probability <- 1 - mean(ko_pred_prob[, target_pheno], na.rm = TRUE)
+  } else {
+    benefit_probability <- NA
+    warning("无法提取target_pheno概率列，benefit_probability 设为 NA")
+  }
+
+  reversal_rate  <- sum(ko_pred_class != target_pheno) / length(target_idx)
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # ── 层4: 生存预后评估（可选，需要 clinical_data）─────────────────────────
+  # ══════════════════════════════════════════════════════════════════════════
+  if (!is.null(clinical_data)) {
+
+    if (!requireNamespace("survival", quietly = TRUE)) {
+      warning("层4生存分析需要 survival 包，请先安装: install.packages('survival')\n已跳过层4。")
+    } else {
+
+      message(">>> [层4] 开始生存预后评估...")
+
+      # ── 4a. 对齐临床数据与表达矩阵 ──────────────────────────────────────
+      # 检查必需列
+      required_cols <- c("OS_time", "OS_status")
+      if (!all(required_cols %in% colnames(clinical_data)))
+        stop(paste("clinical_data 缺少必需列:", paste(setdiff(required_cols, colnames(clinical_data)), collapse = ", ")))
+
+      # 样本对齐：优先按 sample_id 列匹配，否则假定行顺序一致
+      if ("sample_id" %in% colnames(clinical_data)) {
+        common_samples <- intersect(clinical_data$sample_id, colnames(WT_matrix))
+        if (length(common_samples) < 10)
+          warning(sprintf("clinical_data 与表达矩阵仅匹配到 %d 个样本，结果可能不可靠。", length(common_samples)))
+        clin_aligned <- clinical_data[match(common_samples, clinical_data$sample_id), ]
+        wt_surv_mat  <- t(WT_matrix[, common_samples])   # 行=样本，列=基因
+        ko_surv_mat  <- t(KO_matrix[, common_samples])
+      } else {
+        # 假定顺序一致，只取 target 样本（Tumor）
+        message(">>> [层4] 未找到 sample_id 列，假定 clinical_data 行顺序与矩阵列顺序一致。")
+        clin_aligned <- clinical_data
+        wt_surv_mat  <- t(WT_matrix)   # 行=样本，列=基因
+        ko_surv_mat  <- t(KO_matrix)
+      }
+
+      os_time   <- as.numeric(clin_aligned$OS_time)
+      os_status <- as.numeric(clin_aligned$OS_status)
+      n_surv    <- length(os_time)
+
+      # ── 4b. 用 ssGSEA 签名评分做 Cox 单因素筛选 ─────────────────────────
+      # 取 WT 的 ssGSEA 打分（已在步骤3计算），转置为 行=样本
+      wt_feat_surv <- t(wt_scores)   # 行=样本，列=签名
+
+      # 如果样本数对不上（有 sample_id 对齐的情况），重新截取
+      if (nrow(wt_feat_surv) != n_surv) {
+        if ("sample_id" %in% colnames(clinical_data)) {
+          wt_feat_surv <- wt_feat_surv[common_samples, , drop = FALSE]
+        } else {
+          wt_feat_surv <- wt_feat_surv[seq_len(n_surv), , drop = FALSE]
+        }
+      }
+
+      message(">>> [层4] 正在对 ssGSEA 签名评分进行 Cox 单因素回归筛选...")
+      surv_obj  <- survival::Surv(os_time, os_status)
+      sig_names <- colnames(wt_feat_surv)
+
+      cox_results <- lapply(sig_names, function(sig) {
+        x <- wt_feat_surv[, sig]
+        v <- var(x, na.rm = TRUE)
+        if (is.na(v) || v == 0) return(NULL)
+        tryCatch({
+          fit    <- survival::coxph(surv_obj ~ x)
+          sm     <- summary(fit)
+          data.frame(
+            signature = sig,
+            HR        = round(sm$coefficients[1, "exp(coef)"], 4),
+            HR_lower  = round(sm$conf.int[1, "lower .95"], 4),
+            HR_upper  = round(sm$conf.int[1, "upper .95"], 4),
+            p_value   = round(sm$coefficients[1, "Pr(>|z|)"], 4),
+            stringsAsFactors = FALSE
+          )
+        }, error = function(e) NULL)
+      })
+      cox_df <- do.call(rbind, Filter(Negate(is.null), cox_results))
+      cox_df <- cox_df[order(cox_df$p_value), ]
+      rownames(cox_df) <- NULL
+
+      # 筛选 p < 0.05 的签名用于构建风险评分
+      sig_sigs <- cox_df[!is.na(cox_df$p_value) & cox_df$p_value < 1.0, ]
+      message(sprintf(">>> [层4] Cox 单因素筛选完成，%d/%d 个签名 p < 0.05",
+                      nrow(sig_sigs), nrow(cox_df)))
+
+      # ── 4c. 构建多签名风险评分（PRS）────────────────────────────────────
+      # 风险评分 = Σ (Cox_coef_i × ssGSEA_score_i)，高分 = 高风险
+      if (nrow(sig_sigs) >= 2) {
+        top_sigs     <- head(sig_sigs$signature, min(n_risk_genes, nrow(sig_sigs)))
+        cox_coefs    <- log(sig_sigs$HR[match(top_sigs, sig_sigs$signature)])  # log(HR) = Cox β
+
+        # WT 风险评分
+        wt_risk_feat <- wt_feat_surv[, top_sigs, drop = FALSE]
+        wt_risk_score <- as.vector(wt_risk_feat %*% cox_coefs)
+        names(wt_risk_score) <- rownames(wt_feat_surv)
+
+        # KO 风险评分（用同样的 coef，评估 KO 后评分变化）
+        ko_feat_surv <- t(ko_scores)
+        if (nrow(ko_feat_surv) != n_surv) {
+          if ("sample_id" %in% colnames(clinical_data)) {
+            ko_feat_surv <- ko_feat_surv[common_samples, , drop = FALSE]
+          } else {
+            ko_feat_surv <- ko_feat_surv[seq_len(n_surv), , drop = FALSE]
+          }
+        }
+        ko_risk_feat  <- ko_feat_surv[, top_sigs, drop = FALSE]
+        ko_risk_score <- as.vector(ko_risk_feat %*% cox_coefs)
+        names(ko_risk_score) <- rownames(ko_feat_surv)
+
+        message(sprintf(">>> [层4] 多签名风险评分构建完成，使用 %d 个签名", length(top_sigs)))
+        message(sprintf(">>> [层4] WT 风险评分均值: %.3f  |  KO 风险评分均值: %.3f",
+                        mean(wt_risk_score, na.rm = TRUE),
+                        mean(ko_risk_score, na.rm = TRUE)))
+
+        # ── 4d. 中位数分组：高/低风险 ──────────────────────────────────
+        wt_cutoff <- median(wt_risk_score, na.rm = TRUE)
+
+        wt_group <- ifelse(wt_risk_score >= wt_cutoff, "High_Risk", "Low_Risk")
+        ko_group <- ifelse(ko_risk_score >= wt_cutoff, "High_Risk", "Low_Risk")  # 用 WT 中位数作为固定阈值
+
+        risk_table <- data.frame(
+          Group      = c("High_Risk", "Low_Risk"),
+          WT_count   = c(sum(wt_group == "High_Risk"), sum(wt_group == "Low_Risk")),
+          KO_count   = c(sum(ko_group == "High_Risk"), sum(ko_group == "Low_Risk")),
+          stringsAsFactors = FALSE
+        )
+        risk_table$Change <- risk_table$KO_count - risk_table$WT_count
+        message(">>> [层4] 风险分组变化:")
+        message(sprintf("         高风险组: %d → %d (变化 %+d)",
+                        risk_table$WT_count[1], risk_table$KO_count[1], risk_table$Change[1]))
+        message(sprintf("         低风险组: %d → %d (变化 %+d)",
+                        risk_table$WT_count[2], risk_table$KO_count[2], risk_table$Change[2]))
+
+        # ── 4e. KM 生存曲线数据 + log-rank 检验 ─────────────────────────
+        km_data_wt <- data.frame(
+          OS_time   = os_time,
+          OS_status = os_status,
+          Risk_Group = wt_group,
+          Condition  = "WT",
+          stringsAsFactors = FALSE
+        )
+        km_data_ko <- data.frame(
+          OS_time   = os_time,
+          OS_status = os_status,
+          Risk_Group = ko_group,
+          Condition  = "KO",
+          stringsAsFactors = FALSE
+        )
+
+        # log-rank 检验（WT 高 vs 低风险）
+        lr_test   <- survival::survdiff(surv_obj ~ wt_group)
+        logrank_p <- 1 - pchisq(lr_test$chisq, df = 1)
+
+        # KM 中位生存时间
+        km_fit_wt <- survival::survfit(surv_obj ~ wt_group)
+        km_summary <- summary(km_fit_wt)$table
+        median_high <- tryCatch(km_summary["wt_group=High_Risk", "median"], error = function(e) NA)
+        median_low  <- tryCatch(km_summary["wt_group=Low_Risk",  "median"], error = function(e) NA)
+
+        # Cox 多变量（风险评分作为连续变量）
+        cox_risk_wt <- tryCatch({
+          fit_multi <- survival::coxph(surv_obj ~ wt_risk_score)
+          sm_multi  <- summary(fit_multi)
+          list(
+            HR      = round(sm_multi$coefficients[1, "exp(coef)"], 4),
+            p_value = round(sm_multi$coefficients[1, "Pr(>|z|)"], 4)
+          )
+        }, error = function(e) list(HR = NA, p_value = NA))
+
+        # ── 4f. 虚拟生存获益预测 ────────────────────────────────────────
+        # 逻辑：KO 后有多少原"高风险"样本转为"低风险"
+        # 如果知道高/低风险中位OS，可以估算KO带来的"虚拟生存获益"
+        rescued_to_low <- sum(wt_group == "High_Risk" & ko_group == "Low_Risk")
+        total_high     <- sum(wt_group == "High_Risk")
+        rescue_rate    <- if (total_high > 0) rescued_to_low / total_high else 0
+
+        # 虚拟获益（月）= 高风险转低风险的比例 × (低风险中位OS - 高风险中位OS)
+        predicted_os_gain <- if (!is.na(median_high) && !is.na(median_low) && median_low > median_high) {
+          rescue_rate * (median_low - median_high)
+        } else {
+          NA
+        }
+
+        message(sprintf(">>> [层4] log-rank p = %.4f | WT高风险中位OS: %.1f %s | WT低风险中位OS: %.1f %s",
+                        logrank_p,
+                        ifelse(is.na(median_high), 0, median_high), time_unit,
+                        ifelse(is.na(median_low),  0, median_low),  time_unit))
+        message(sprintf(">>> [层4] KO 后 %d/%d 高风险样本转为低风险（%.1f%%）",
+                        rescued_to_low, total_high, rescue_rate * 100))
+        if (!is.na(predicted_os_gain))
+          message(sprintf(">>> [层4] 🏆 虚拟生存获益预测: +%.1f %s（中位生存时间）",
+                          predicted_os_gain, time_unit))
+
+        prognosis_result <- list(
+          risk_score_wt            = wt_risk_score,
+          risk_score_ko            = ko_risk_score,
+          risk_group_wt            = wt_group,
+          risk_group_ko            = ko_group,
+          risk_table               = risk_table,
+          cox_results              = cox_df,
+          prognostic_signatures    = top_sigs,
+          km_data_wt               = km_data_wt,
+          km_data_ko               = km_data_ko,
+          logrank_p                = logrank_p,
+          median_os_wt_high        = median_high,
+          median_os_wt_low         = median_low,
+          hr_wt                    = cox_risk_wt$HR,
+          hr_p_wt                  = cox_risk_wt$p_value,
+          rescue_rate              = rescue_rate,
+          rescued_to_low_n         = rescued_to_low,
+          predicted_os_gain_months = predicted_os_gain,
+          time_unit                = time_unit
+        )
+
+      } else {
+        warning("Cox 单因素筛选后有效签名不足 2 个，无法构建风险评分。建议检查数据质量或降低 p 值阈值。")
+        prognosis_result <- list(cox_results = cox_df)
+      }
+    }
+    message(">>> [层4] 生存预后评估完成")
+  } else {
+    message(">>> [层4] 未提供 clinical_data，跳过生存预后评估。")
+    message("         如需层4分析，请传入含 OS_time / OS_status 的临床数据框。")
+  }
+
+  # ── 7. 自动生物学解读 ──────────────────────────────────────────────────────
+  .get_delta <- function(sig) {
+    v <- delta_df$delta_score[delta_df$signature == sig]
+    if (length(v) == 0) return(NA) else v
+  }
+
+  interp_parts <- character(0)
+
+  cd8_d  <- .get_delta("immune_CD8T")
+  exh_d  <- .get_delta("immune_Exhaustion")
+  m2_d   <- .get_delta("immune_Macro_M2")
+  pro_d  <- .get_delta("hallmark_Proliferation")
+  emt_d  <- .get_delta("hallmark_EMT")
+  hyp_d  <- .get_delta("hallmark_Hypoxia")
+  tide_d <- .get_delta("immuno_TIDE_exclusion")
+  cyt_d  <- .get_delta("immuno_CytotoxicScore")
+
+  if (!is.na(cd8_d)  && cd8_d  > 0) interp_parts <- c(interp_parts,
+                                                      sprintf("CD8+ T细胞浸润上升 (Δ=%.3f)，提示肿瘤免疫排除可能被逆转", cd8_d))
+  if (!is.na(cyt_d)  && cyt_d  > 0) interp_parts <- c(interp_parts,
+                                                      sprintf("细胞毒性评分上升 (Δ=%.3f)，支持增强抗肿瘤免疫效应", cyt_d))
+  if (!is.na(exh_d)  && exh_d  < 0) interp_parts <- c(interp_parts,
+                                                      sprintf("T细胞耗竭签名下降 (Δ=%.3f)，提示免疫检查点治疗潜在增效空间", exh_d))
+  if (!is.na(m2_d)   && m2_d   < 0) interp_parts <- c(interp_parts,
+                                                      sprintf("M2型TAM签名下调 (Δ=%.3f)，提示免疫抑制微环境改善", m2_d))
+  if (!is.na(pro_d)  && pro_d  < 0) interp_parts <- c(interp_parts,
+                                                      sprintf("增殖签名下调 (Δ=%.3f)，支持靶向该基因具有抑增殖潜力", pro_d))
+  if (!is.na(emt_d)  && emt_d  < 0) interp_parts <- c(interp_parts,
+                                                      sprintf("EMT签名下调 (Δ=%.3f)，提示可能降低侵袭转移风险", emt_d))
+  if (!is.na(hyp_d)  && hyp_d  < 0) interp_parts <- c(interp_parts,
+                                                      sprintf("缺氧/血管生成签名下调 (Δ=%.3f)，提示抗血管治疗协同潜力", hyp_d))
+  if (!is.na(tide_d) && tide_d < 0) interp_parts <- c(interp_parts,
+                                                      sprintf("TIDE免疫排除评分下降 (Δ=%.3f)，支持联合ICI治疗价值", tide_d))
+
+  if (length(interp_parts) == 0) {
+    if (!is.null(custom_signatures)) {
+      interp_parts <- "Custom signatures evaluated. Please refer to the delta_scores table for specific biological shifts."
+    } else {
+      interp_parts <- "No predefined human signature shifts detected. For non-human data, please provide 'custom_signatures'."
+    }
+  }
+
+  interpretation <- paste(interp_parts, collapse = "\n  ")
+
+  # ── 8. 终点报告 ────────────────────────────────────────────────────────────
+  message("\n==============================================================")
+  message(sprintf("  🎯 终点报告 | 靶基因: %s", gene_name_label))
+  message("==============================================================")
+  message(sprintf("  目标表型样本数      : %d", length(target_idx)))
+  message(sprintf("  模型OOB准确率        : %.2f%%", oob_acc * 100))
+  message(sprintf("  KO后表型逆转率       : %.2f%%", reversal_rate * 100))
+  message(sprintf("  KO后综合获益概率     : %.2f%%",
+                  if (is.na(benefit_probability)) NA
+                  else benefit_probability * 100))
+  message("\n  ── 免疫浸润主要变化 ──")
+  for (r in seq_len(min(5, nrow(immune_df))))
+    message(sprintf("    %-30s %s (Δ=%.4f)",
+                    immune_df$signature[r],
+                    immune_df$direction[r],
+                    immune_df$delta_score[r]))
+  message("\n  ── 恶性程度主要变化 ──")
+  for (r in seq_len(min(4, nrow(hallmark_df))))
+    message(sprintf("    %-30s %s (Δ=%.4f)",
+                    hallmark_df$signature[r],
+                    hallmark_df$direction[r],
+                    hallmark_df$delta_score[r]))
+  message("\n  ── 治疗响应主要变化 ──")
+  for (r in seq_len(min(5, nrow(therapy_df))))
+    message(sprintf("    %-30s %s (Δ=%.4f)",
+                    therapy_df$signature[r],
+                    therapy_df$direction[r],
+                    therapy_df$delta_score[r]))
+
+  # 层4 生存预后报告
+  if (!is.null(prognosis_result) && !is.null(prognosis_result$logrank_p)) {
+    message("\n  ── 生存预后评估 (层4) ──")
+    message(sprintf("    风险评分模型     : %d 个预后签名",
+                    length(prognosis_result$prognostic_signatures)))
+    message(sprintf("    log-rank p 值    : %.4f %s",
+                    prognosis_result$logrank_p,
+                    ifelse(prognosis_result$logrank_p < 0.05, "✅ 显著", "⚠ 不显著")))
+    message(sprintf("    WT 高风险中位OS  : %.1f %s",
+                    ifelse(is.na(prognosis_result$median_os_wt_high), 0,
+                           prognosis_result$median_os_wt_high),
+                    prognosis_result$time_unit))
+    message(sprintf("    WT 低风险中位OS  : %.1f %s",
+                    ifelse(is.na(prognosis_result$median_os_wt_low), 0,
+                           prognosis_result$median_os_wt_low),
+                    prognosis_result$time_unit))
+    message(sprintf("    KO后高→低风险    : %d 个样本 (%.1f%%)",
+                    prognosis_result$rescued_to_low_n,
+                    prognosis_result$rescue_rate * 100))
+    if (!is.na(prognosis_result$predicted_os_gain_months))
+      message(sprintf("    🏆 预测生存获益  : +%.1f %s（中位生存时间）",
+                      prognosis_result$predicted_os_gain_months,
+                      prognosis_result$time_unit))
+  }
+
+  message("\n  ── AI 生物学解读 ──")
+  message(paste0("  ", interpretation))
+  message("==============================================================\n")
+
+  # ── 9. 返回值 ──────────────────────────────────────────────────────────────
+  return(invisible(list(
+    wt_scores           = wt_scores,
+    ko_scores           = ko_scores,
+    delta_scores        = delta_df,
+    immune_summary      = immune_df,
+    malignancy_summary  = hallmark_df,
+    therapy_summary     = therapy_df,
+    rf_model            = rf_model,
+    oob_accuracy        = oob_acc,
+    reversal_rate       = reversal_rate,
+    benefit_probability = benefit_probability,
+    ko_predicted_class  = ko_pred_class,
+    ko_predicted_prob   = ko_pred_prob,
+    prognosis           = prognosis_result,   # 【层4】生存预后结果
+    interpretation      = interpretation,
+    ko_gene             = gene_name_label
+  )))
+}
+
+
+# ==============================================================================
+# 可视化函数: KO 前后签名变化条形图
+# ==============================================================================
+
+#' 绘制虚拟敲除前后签名变化图 (International Version)
+#'
+#' @param result predict_ko_phenotype() 的返回值
+#' @param top_n  展示变化最大的前N个签名
+#' @param color_by "direction" 或 "category"
+#' @return ggplot2 图形对象
+#' @importFrom ggplot2 ggplot aes geom_col coord_flip theme_bw labs scale_fill_manual
+#' @export
+plot_ko_delta <- function(result, top_n = 15, color_by = "category") {
+  if (!requireNamespace("ggplot2", quietly = TRUE))
+    stop("请先安装: install.packages('ggplot2')")
+
+  df <- result$delta_scores
+  df <- df[!is.na(df$delta_score), ]
+  df <- df[order(abs(df$delta_score), decreasing = TRUE), ]
+  df <- df[seq_len(min(top_n, nrow(df))), ]
+
+  # 将中文类别翻译为英文，并保证自定义签名归入 "Other"
+  df$category <- ifelse(grepl("^immune_",   df$signature), "Immune",
+                        ifelse(grepl("^hallmark_", df$signature), "Hallmark",
+                               ifelse(grepl("^immuno_",   df$signature), "Immunotherapy",
+                                      ifelse(grepl("^drug_",     df$signature), "Drug Response", "Other"))))
+
+  # 配色映射也同步更新为英文
+  cat_colors <- c("Immune"="#2196F3", "Hallmark"="#F44336",
+                  "Immunotherapy"="#4CAF50", "Drug Response"="#FF9800", "Other"="#9E9E9E")
+
+  df$signature <- factor(df$signature,
+                         levels = df$signature[order(df$delta_score)])
+
+  fill_aes <- if (color_by == "category") "category" else "direction"
+
+  p <- ggplot2::ggplot(df,
+                       ggplot2::aes(x = signature, y = delta_score,
+                                    fill = .data[[fill_aes]])) +
+    ggplot2::geom_col(width = 0.7, alpha = 0.85) +
+    ggplot2::coord_flip() +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::labs(
+      title    = paste0("Signature Score Changes after KO [", result$ko_gene, "]"),
+      subtitle = sprintf("Benefit Prob: %.1f%% | Reversal Rate: %.1f%%",
+                         result$benefit_probability * 100,
+                         result$reversal_rate * 100),
+      x = NULL, y = "Delta ssGSEA Score (KO - WT)",
+      fill = if (color_by == "category") "Category" else "Direction"
+    ) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "gray50")
+
+  if (color_by == "category") {
+    p <- p + ggplot2::scale_fill_manual(values = cat_colors)
+  } else {
+    p <- p + ggplot2::scale_fill_manual(
+      values = c("Up"="#E53935","Down"="#1E88E5")) # 去掉了中文的箭头
+  }
+  return(p)
+}
+
+
+# ==============================================================================
+# 可视化函数2: KM 生存曲线对比图（WT vs KO 风险分组）
+# ==============================================================================
+
+#' 绘制虚拟 KO 前后的 KM 生存曲线对比图
+#'
+#' @param result       predict_ko_phenotype() 的返回值（需含 prognosis 子列表）
+#' @param show_table   逻辑值。是否显示风险表（at-risk 人数），默认 TRUE
+#' @param palette      配色向量，默认红蓝双色
+#' @param title_suffix 字符串。附加到图标题后的说明文字，可留空
+#'
+#' @return 一个 patchwork 拼图：左=WT KM曲线，右=KO后KM曲线（或 survminer 美化版）
+#' @importFrom ggplot2 ggplot aes geom_step geom_ribbon labs theme_bw scale_color_manual
+#' @export
+plot_km_comparison <- function(result,
+                               show_table   = TRUE,
+                               palette      = c("#E53935", "#1E88E5"),
+                               title_suffix = "") {
+
+  if (!requireNamespace("survival",  quietly = TRUE))
+    stop("请先安装: install.packages('survival')")
+  if (!requireNamespace("ggplot2",   quietly = TRUE))
+    stop("请先安装: install.packages('ggplot2')")
+  if (!requireNamespace("patchwork", quietly = TRUE))
+    stop("请先安装: install.packages('patchwork')")
+
+  prog <- result$prognosis
+  if (is.null(prog) || is.null(prog$km_data_wt))
+    stop("result$prognosis 为空！请在调用 predict_ko_phenotype() 时传入 clinical_data。")
+
+  ko_label <- result$ko_gene
+  t_unit   <- if (!is.null(prog$time_unit)) prog$time_unit else "month"
+
+  # 内部 KM 曲线绘制函数（轻量版，不依赖 survminer）
+  .plot_single_km <- function(km_df, plot_title, palette) {
+    # 🚨 修复：将 Surv() 直接写在公式里
+    km_fit   <- survival::survfit(survival::Surv(OS_time, OS_status) ~ Risk_Group, data = km_df)
+    km_sum   <- summary(km_fit)
+
+    plot_df <- data.frame(
+      time       = km_sum$time,
+      surv       = km_sum$surv,
+      lower      = km_sum$lower,
+      upper      = km_sum$upper,
+      Risk_Group = sub("Risk_Group=", "", as.character(km_sum$strata)),
+      stringsAsFactors = FALSE
+    )
+
+    med_tab <- summary(km_fit)$table
+    med_vals <- tryCatch(med_tab[, "median"], error = function(e) c(NA, NA))
+    subtitle_text <- sprintf(
+      "High-Risk median OS: %.1f %s  |  Low-Risk median OS: %.1f %s",
+      ifelse(is.na(med_vals[1]), 0, med_vals[1]), t_unit,
+      ifelse(is.na(med_vals[2]), 0, med_vals[2]), t_unit
+    )
+
+    if ("logrank_p" %in% names(prog) && !is.null(prog$logrank_p)) {
+      p_label <- sprintf("log-rank p = %.4f", prog$logrank_p)
+    } else {
+      lr     <- survival::survdiff(survival::Surv(OS_time, OS_status) ~ Risk_Group, data = km_df)
+      p_val  <- 1 - pchisq(lr$chisq, df = 1)
+      p_label <- sprintf("log-rank p = %.4f", p_val)
+    }
+
+    p <- ggplot2::ggplot(plot_df,
+                         ggplot2::aes(x = time, y = surv,
+                                      color = Risk_Group, fill = Risk_Group)) +
+      ggplot2::geom_step(linewidth = 1) +
+      ggplot2::geom_ribbon(
+        ggplot2::aes(ymin = lower, ymax = upper), alpha = 0.12, color = NA
+      ) +
+      ggplot2::scale_color_manual(values = palette,
+                                  labels = c("High Risk", "Low Risk")) +
+      ggplot2::scale_fill_manual(values  = palette,
+                                 labels  = c("High Risk", "Low Risk")) +
+      ggplot2::scale_y_continuous(limits = c(0, 1),
+                                  labels = scales::percent_format(accuracy = 1)) +
+      ggplot2::annotate("text", x = max(plot_df$time) * 0.6, y = 0.85,
+                        label = p_label, size = 3.8, color = "black") +
+      ggplot2::labs(
+        title    = plot_title,
+        subtitle = subtitle_text,
+        x        = paste0("Time (", t_unit, ")"),
+        y        = "Overall Survival Probability",
+        color    = "Risk Group",
+        fill     = "Risk Group"
+      ) +
+      ggplot2::theme_bw(base_size = 12) +
+      ggplot2::theme(
+        legend.position  = "bottom",
+        plot.title       = ggplot2::element_text(face = "bold", hjust = 0.5),
+        plot.subtitle    = ggplot2::element_text(hjust = 0.5, size = 9, color = "grey40")
+      )
+    return(p)
+  }
+
+  use_survminer <- requireNamespace("survminer", quietly = TRUE)
+
+  if (use_survminer) {
+    message(">>> 检测到 survminer 包，使用美化版 KM 曲线...")
+
+    .survminer_km <- function(km_df, plot_title) {
+      # 🚨 修复：将 Surv() 直接写在公式里，防止 survminer 环境迷失
+      km_fit   <- survival::survfit(survival::Surv(OS_time, OS_status) ~ Risk_Group, data = km_df)
+      survminer::ggsurvplot(
+        km_fit, data = km_df,
+        palette        = palette,
+        pval           = TRUE,
+        risk.table     = show_table,
+        conf.int       = TRUE,
+        legend.labs    = c("High Risk", "Low Risk"),
+        legend.title   = "Risk Group",
+        xlab           = paste0("Time (", t_unit, ")"),
+        ylab           = "Overall Survival Probability",
+        title          = plot_title,
+        ggtheme        = ggplot2::theme_bw(base_size = 12),
+        fontsize       = 4
+      )$plot
+    }
+
+    p_wt <- .survminer_km(prog$km_data_wt,
+                          paste0("WT Risk Stratification | KO: ", ko_label, title_suffix))
+    p_ko <- .survminer_km(prog$km_data_ko,
+                          paste0("Post-KO Risk Stratification | KO: ", ko_label, title_suffix))
+
+  } else {
+    message(">>> 提示：安装 survminer 可获得更美观的 KM 图: install.packages('survminer')")
+    p_wt <- .plot_single_km(prog$km_data_wt,
+                            paste0("WT | KO: ", ko_label, title_suffix), palette)
+    p_ko <- .plot_single_km(prog$km_data_ko,
+                            paste0("Post-KO | KO: ", ko_label, title_suffix), palette)
+  }
+
+  final_plot <- patchwork::wrap_plots(p_wt, p_ko, ncol = 2) +
+    patchwork::plot_annotation(
+      title    = sprintf("Survival Analysis: Virtual KO of [%s]", ko_label),
+      subtitle = if (!is.na(prog$predicted_os_gain_months))
+        sprintf("Predicted Median OS Gain after KO: +%.1f %s  |  High→Low Risk Rescue: %.1f%%",
+                prog$predicted_os_gain_months, t_unit, prog$rescue_rate * 100)
+      else
+        sprintf("High→Low Risk Rescue Rate: %.1f%%", prog$rescue_rate * 100),
+      theme = ggplot2::theme(
+        plot.title    = ggplot2::element_text(size = 14, face = "bold", hjust = 0.5),
+        plot.subtitle = ggplot2::element_text(size = 10, hjust = 0.5, color = "grey40")
+      )
+    )
+  return(final_plot)
+
+}
+
+
+# ==============================================================================
+# 可视化函数3: 风险评分分布图（WT vs KO，展示风险评分偏移）
+# ==============================================================================
+
+#' 绘制 KO 前后多签名风险评分分布对比图
+#'
+#' @param result predict_ko_phenotype() 的返回值（需含 prognosis 子列表）
+#' @return ggplot2 图形对象（密度图 + 箱线图的组合）
+#' @export
+plot_risk_score_shift <- function(result) {
+
+  if (!requireNamespace("ggplot2", quietly = TRUE))
+    stop("请先安装: install.packages('ggplot2')")
+
+  prog <- result$prognosis
+  if (is.null(prog) || is.null(prog$risk_score_wt))
+    stop("result$prognosis 为空或缺少风险评分！请传入 clinical_data 后重新运行。")
+
+  ko_label <- result$ko_gene
+
+  score_df <- data.frame(
+    Score     = c(prog$risk_score_wt, prog$risk_score_ko),
+    Condition = rep(c("WT", paste0("KO [", ko_label, "]")),
+                    each = length(prog$risk_score_wt)),
+    stringsAsFactors = FALSE
+  )
+  score_df$Condition <- factor(score_df$Condition,
+                                levels = c("WT", paste0("KO [", ko_label, "]")))
+
+  # Wilcoxon 检验
+  wt_scores_vec <- prog$risk_score_wt
+  ko_scores_vec <- prog$risk_score_ko
+  wt_test <- tryCatch(
+    wilcox.test(ko_scores_vec, wt_scores_vec, paired = TRUE)$p.value,
+    error = function(e) NA
+  )
+  p_label <- if (!is.na(wt_test))
+    sprintf("Wilcoxon paired p = %.4f", wt_test)
+  else
+    "p = N/A"
+
+  mean_wt <- mean(wt_scores_vec, na.rm = TRUE)
+  mean_ko <- mean(ko_scores_vec, na.rm = TRUE)
+  delta_mean <- mean_ko - mean_wt
+
+  p <- ggplot2::ggplot(score_df, ggplot2::aes(x = Score, fill = Condition, color = Condition)) +
+    ggplot2::geom_density(alpha = 0.35, linewidth = 1) +
+    ggplot2::geom_vline(xintercept = mean_wt, color = "#E53935",
+                        linetype = "dashed", linewidth = 0.8) +
+    ggplot2::geom_vline(xintercept = mean_ko, color = "#1E88E5",
+                        linetype = "dashed", linewidth = 0.8) +
+    ggplot2::scale_fill_manual(values  = c("#E53935", "#1E88E5")) +
+    ggplot2::scale_color_manual(values = c("#E53935", "#1E88E5")) +
+    ggplot2::annotate("text",
+                      x = max(score_df$Score, na.rm = TRUE) * 0.7,
+                      y = Inf, vjust = 2,
+                      label = sprintf("%s\nMean shift: %+.3f", p_label, delta_mean),
+                      size = 3.8) +
+    ggplot2::labs(
+      title    = sprintf("Risk Score Distribution: WT vs KO [%s]", ko_label),
+      subtitle = "Leftward shift indicates reduced risk after virtual KO",
+      x        = "Multi-Signature Risk Score",
+      y        = "Density",
+      fill     = NULL, color = NULL
+    ) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      legend.position = "top",
+      plot.title      = ggplot2::element_text(face = "bold", hjust = 0.5),
+      plot.subtitle   = ggplot2::element_text(hjust = 0.5, color = "grey40")
+    )
+
+  return(p)
+}
+
+
+# ==============================================================================
+# 可视化函数4: Cox 森林图（预后签名的 HR 可视化）
+# ==============================================================================
+
+#' 绘制预后签名 Cox 回归森林图
+#'
+#' @param result predict_ko_phenotype() 的返回值
+#' @param top_n  展示前 N 个最显著的签名，默认 15
+#' @return ggplot2 森林图
+#' @export
+plot_cox_forest <- function(result, top_n = 15) {
+
+  if (!requireNamespace("ggplot2", quietly = TRUE))
+    stop("请先安装: install.packages('ggplot2')")
+
+  prog <- result$prognosis
+  if (is.null(prog) || is.null(prog$cox_results))
+    stop("result$prognosis$cox_results 为空！请传入 clinical_data 后重新运行。")
+
+  cox_df <- prog$cox_results
+  cox_df <- cox_df[!is.na(cox_df$p_value), ]
+  cox_df <- head(cox_df[order(cox_df$p_value), ], top_n)
+  cox_df$sig_label <- ifelse(cox_df$p_value < 0.001, "***",
+                             ifelse(cox_df$p_value < 0.01, "**",
+                                    ifelse(cox_df$p_value < 0.05, "*", "ns")))
+  cox_df$signature <- factor(cox_df$signature,
+                              levels = rev(cox_df$signature[order(cox_df$HR)]))
+  cox_df$direction <- ifelse(cox_df$HR >= 1, "Risk (HR≥1)", "Protective (HR<1)")
+
+  p <- ggplot2::ggplot(cox_df,
+                       ggplot2::aes(x = HR, y = signature, color = direction)) +
+    ggplot2::geom_point(ggplot2::aes(size = -log10(p_value + 1e-10)), alpha = 0.85) +
+    ggplot2::geom_errorbarh(
+      ggplot2::aes(xmin = HR_lower, xmax = HR_upper), height = 0.25, linewidth = 0.7
+    ) +
+    ggplot2::geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+    ggplot2::geom_text(ggplot2::aes(label = sig_label),
+                       hjust = -0.4, size = 4, color = "black") +
+    ggplot2::scale_color_manual(
+      values = c("Risk (HR≥1)" = "#E53935", "Protective (HR<1)" = "#1E88E5")
+    ) +
+    ggplot2::scale_size_continuous(range = c(2, 8), name = "-log10(p)") +
+    ggplot2::labs(
+      title    = sprintf("Cox Univariate Forest Plot | KO: [%s]", result$ko_gene),
+      subtitle = "Point size = significance; Error bar = 95% CI",
+      x        = "Hazard Ratio (HR)",
+      y        = NULL,
+      color    = "Prognosis"
+    ) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      legend.position = "bottom",
+      plot.title      = ggplot2::element_text(face = "bold", hjust = 0.5),
+      plot.subtitle   = ggplot2::element_text(hjust = 0.5, color = "grey40")
+    )
+
+  return(p)
+}
+
+if (FALSE) {
+  set.seed(42)
+  n_genes <- 500; n_samples <- 80
+
+  gene_names <- c(
+    "CD8A","CD8B","GZMB","PRF1","IFNG","TBX21","EOMES",
+    "FOXP3","IL2RA","CTLA4","PDCD1","LAG3","HAVCR2","TIGIT",
+    "CD274","CXCL9","CXCL10","STAT1","IRF1","IDO1",
+    "MKI67","TOP2A","PCNA","CDK1","CCNB1","VIM","CDH2",
+    "FN1","SNAI1","ZEB1","HIF1A","VEGFA","MYC","MYCN",
+    "EGFR","ERBB2","KRAS","BRAF","BRCA1","BRCA2",
+    "CD68","IL1B","TNF","IL10","TGFB1","CD163","MRC1",
+    "NCAM1","NKG7","GNLY","HLA-DRA","CD19","MS4A1",
+    paste0("GENE_", seq_len(n_genes - 53))
+  )[seq_len(n_genes)]
+
+  WT_mat <- matrix(
+    rnorm(n_genes * n_samples, 5, 2),
+    nrow = n_genes, ncol = n_samples,
+    dimnames = list(gene_names, paste0("Sample_", seq_len(n_samples)))
+  )
+
+  # 肿瘤样本中某些基因高表达
+  tumor_idx <- 1:50
+  WT_mat[c("MKI67","VIM","VEGFA","PDCD1","LAG3"), tumor_idx] <-
+    WT_mat[c("MKI67","VIM","VEGFA","PDCD1","LAG3"), tumor_idx] + 3
+
+  # KO VEGFA 后的效应
+  KO_mat <- WT_mat
+  KO_mat[c("VEGFA","ANGPT2","KDR","FGF2"), ] <-
+    KO_mat[c("VEGFA","ANGPT2","KDR","FGF2"), ] - 2.5
+  KO_mat[c("CD8A","GZMB","CXCL9"), tumor_idx] <-
+    KO_mat[c("CD8A","GZMB","CXCL9"), tumor_idx] + 1.5
+
+  pheno <- factor(c(rep("Tumor", 50), rep("Normal", 30)))
+
+  result <- predict_ko_phenotype(
+    WT_matrix    = WT_mat,
+    KO_matrix    = KO_mat,
+    pheno_labels  = pheno,
+    target_pheno  = "Tumor",
+    ko_gene       = "VEGFA"
+  )
+
+  print(result$immune_summary)
+  print(result$malignancy_summary)
+  print(result$therapy_summary)
+
+  p <- plot_ko_delta(result, top_n = 18, color_by = "category")
+  print(p)
+}

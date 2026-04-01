@@ -1,0 +1,79 @@
+# ==============================================================================
+# bulkKnk 全链路转化医学分析流程测试
+# 场景：从 TCGA-STAD 原始数据出发，筛选靶点并预测免疫干预效果
+# ==============================================================================
+
+# 0. 加载开发中的包
+devtools::load_all()
+data("tcga_stad_mini")
+
+# ------------------------------------------------------------------------------
+# 1. 数据预处理：智能特征筛选 (Module 0.1)
+# 核心：自动“保送”所有 AI 签名基因，剩余名额由高变基因 (HVGs) 补齐
+# ------------------------------------------------------------------------------
+message("\n--- Step 1: 智能特征筛选 ---")
+sub_expr <- select_advanced_features(tcga_stad_mini$expr_matrix, n_features = 500)
+
+# ------------------------------------------------------------------------------
+# 2. 靶点发现：WGCNA 模块识别 (Module 0)
+# 核心：寻找与肿瘤表型 (Tumor vs Normal) 最相关的基因模块
+# ------------------------------------------------------------------------------
+message("\n--- Step 2: WGCNA 模块识别 ---")
+sample_trait <- as.numeric(as.factor(tcga_stad_mini$pheno_data$SampleType))
+wgcna_res <- identify_hub_modules(sub_expr, sample_trait)
+
+# ------------------------------------------------------------------------------
+# 3. 网络构建：GENIE3 + ARACNE 净化 (Module 1)
+# 核心：对 WGCNA 筛选出的 Hub 基因构建高精度因果网络
+# ------------------------------------------------------------------------------
+message("\n--- Step 3: 因果网络构建与净化 ---")
+# 仅针对 WGCNA 筛选出的核心基因集运行，提高运算速度和准确性
+focus_expr <- sub_expr[, wgcna_res$best_genes]
+net_raw <- infer_causal_network(focus_expr)
+net_clean <- refine_network_aracne(net_raw$clean_matrix, eps = 0.1)
+
+# 归一化网络权重矩阵
+W_norm <- sweep(t(net_clean), 2, colSums(t(net_clean)) + 1e-9, FUN="/")
+
+# ------------------------------------------------------------------------------
+# 4. 虚拟干预：批量虚拟敲除 (Module 2)
+# 核心：仅针对 Tumor 样本，模拟敲除关键靶点 (以 CD274 和 MYC 为例)
+# ------------------------------------------------------------------------------
+message("\n--- Step 4: 批量虚拟敲除 (Target: CD274 + MYC) ---")
+ko_data <- batch_virtual_knockout(
+  expr_matrix = focus_expr,
+  pheno_vec = tcga_stad_mini$pheno_data$SampleType,
+  target_pheno = "Tumor",
+  target_genes = c("CD274", "MYC"), # 你可以根据 WGCNA 结果更换靶点
+  adj_matrix = W_norm
+)
+
+# ------------------------------------------------------------------------------
+# 5. AI 评估：多维表型逆转预测 (Module 4 - v2 引擎)
+# 核心：基于 WGCNA 核心基因定义 Resistant/Sensitive 基线，预测重塑效果
+# ------------------------------------------------------------------------------
+message("\n--- Step 5: AI 表型逆转预测 ---")
+
+# 自动分型：使用 WGCNA 模块中贡献最大的基因作为分类坐标系
+core_gene <- wgcna_res$best_genes[1]
+baseline_labels <- ifelse(focus_expr[, core_gene] > median(focus_expr[, core_gene]),
+                          "Resistant", "Sensitive")
+
+# 运行 v2 评估引擎 (注意：t() 转置以符合 行=基因, 列=样本 格式)
+ai_report <- predict_ko_phenotype(
+  WT_matrix    = t(ko_data$WT),
+  KO_matrix    = t(ko_data$KO),
+  pheno_labels = baseline_labels,
+  target_pheno = "Resistant",
+  ko_gene      = "CD274+MYC"
+)
+
+# ------------------------------------------------------------------------------
+# 6. 可视化：结果产出
+# ------------------------------------------------------------------------------
+message("\n--- Step 6: 结果可视化 ---")
+# 绘制签名变化条形图
+plot_ko_delta(ai_report, color_by = "category")
+
+# 如果你还有之前的差异分析数据，也可以画双火山图对比
+# plot_dual_volcano(...)

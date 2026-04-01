@@ -1,0 +1,26 @@
+{
+    "id": "A3DF0390",
+    "path": "~/Documents/bulkKnk/R/identify_hub_modules.R",
+    "project_path": "R/identify_hub_modules.R",
+    "type": "r_source",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1775011144295.0,
+    "source_on_save": false,
+    "relative_order": 9,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "33,18",
+        "scrollLine": "0"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1775011272,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1775011272,
+    "read_only": false,
+    "read_only_alternatives": []
+}

@@ -1,0 +1,98 @@
+# =========================================================================
+# 脚本：生成 bulkKnk 的内置真实测试数据 (TCGA-STAD subset)
+# =========================================================================
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+
+message(">>> 1. 正在向 GDC 提交 TCGA-STAD (胃癌) RNA-seq 查询请求...")
+query <- GDCquery(
+  project = "TCGA-STAD",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+# 为了缩减 R 包体积，我们只随机抽取 50 个 Tumor (肿瘤) 和 10 个 Normal (正常) 样本
+# 获取所有样本的 barcode
+all_barcodes <- getResults(query, cols = c("cases"))
+# 简单区分一下 Tumor (01A) 和 Normal (11A)
+tumor_cases <- head(all_barcodes[grepl("-01A", all_barcodes)], 50)
+normal_cases <- head(all_barcodes[grepl("-11A", all_barcodes)], 10)
+
+query_mini <- GDCquery(
+  project = "TCGA-STAD",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  barcode = c(tumor_cases, normal_cases)
+)
+
+message(">>> 2. 正在下载表达数据 (这可能需要几分钟，请保持网络畅通)...")
+GDCdownload(query_mini)
+
+message(">>> 3. 正在组装表达矩阵与临床信息...")
+tcga_data <- GDCprepare(query_mini)
+
+# 提取 TPM (Transcripts Per Million) 矩阵，这比 Raw Counts 更适合做网络推断
+tpm_matrix <- assay(tcga_data, "tpm_unstrand")
+
+# 提取基因的 SYMBOL 名 (TCGAbiolinks 默认是 Ensembl ID)
+gene_info <- rowData(tcga_data)
+rownames(tpm_matrix) <- gene_info$gene_name
+
+# 提取临床信息 (用于区分耐药/敏感，或者肿瘤/正常)
+clinical_info <- colData(tcga_data)
+
+message(">>> 4. 数据降维与浓缩 (提纯核心网络基因)...")
+# a. 去除低表达基因
+tpm_matrix <- tpm_matrix[rowSums(tpm_matrix > 1) > (ncol(tpm_matrix) * 0.2), ]
+
+# b. 提取绝对中位差 (MAD) 最大的 Top 500 个高变基因 (代表主要的转录组方差)
+mads <- apply(tpm_matrix, 1, mad)
+top_var_genes <- names(sort(mads, decreasing = TRUE)[1:500])
+
+# c. 强行加入我们关注的免疫/耐药相关基因 (防止它们方差不够被踢掉)
+immune_genes <- c("CD274", "PDCD1", "CTLA4", "LAG3", "HAVCR2", "TIGIT", "CXCL9", "CXCL10", "STAT3", "MYC")
+final_genes <- unique(c(immune_genes, top_var_genes))
+# 确保这些基因在矩阵里
+final_genes <- intersect(final_genes, rownames(tpm_matrix))
+
+# d. 截取最终的微型矩阵
+mini_matrix <- tpm_matrix[final_genes, ]
+# 格式化为：行=样本，列=基因 (符合我们 bulkKnk 的输入标准)
+tcga_stad_expr <- t(mini_matrix)
+
+# 整理精简的临床表型数据
+tcga_stad_pheno <- data.frame(
+  SampleID = rownames(tcga_stad_expr),
+  SampleType = ifelse(grepl("-11A", rownames(tcga_stad_expr)), "Normal", "Tumor"),
+  stringsAsFactors = FALSE
+)
+
+# 安全提取临床信息（防御 GDC 列名变动导致报错）
+if ("tumor_stage" %in% colnames(clinical_info)) {
+  tcga_stad_pheno$Stage <- clinical_info$tumor_stage
+} else if ("ajcc_pathologic_stage" %in% colnames(clinical_info)) {
+  tcga_stad_pheno$Stage <- clinical_info$ajcc_pathologic_stage
+} else {
+  tcga_stad_pheno$Stage <- "Unknown"
+}
+
+if ("vital_status" %in% colnames(clinical_info)) {
+  tcga_stad_pheno$VitalStatus <- clinical_info$vital_status
+} else {
+  tcga_stad_pheno$VitalStatus <- "Unknown"
+}
+
+rownames(tcga_stad_pheno) <- tcga_stad_pheno$SampleID
+
+# 组装成一个 List
+tcga_stad_mini <- list(
+  expr_matrix = tcga_stad_expr,
+  pheno_data = tcga_stad_pheno
+)
+
+message(">>> 5. 正在将真实的 TCGA 数据打包进 bulkKnk 引擎中...")
+usethis::use_data(tcga_stad_mini, overwrite = TRUE)
+
+message(">>> 完美！测试数据集构建完毕。")

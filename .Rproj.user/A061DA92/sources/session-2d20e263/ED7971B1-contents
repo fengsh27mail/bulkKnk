@@ -1,0 +1,149 @@
+# 1. 一键载入 UCSC Xena 数据并构建 cohort 对象
+my_cohort <- import_xena_cohort(
+  expr_file = "TCGA-LUAD.star_fpkm.tsv.gz.tsv", 
+  surv_file = "TCGA-LUAD.survival.tsv.gz.tsv"
+)
+
+# 2. 直接无缝提取数据喂给 WGCNA (Module 0.1)
+# 2. 直接无缝提取数据喂给 WGCNA (Module 0.1)
+sub_expr <- select_advanced_features(my_cohort$expr_matrix, n_features = 500)
+
+# 🚨 核心修复：用真实的临床生存结局 (1=死亡, 0=存活) 替代全 1 的 Tumor 标签！
+# 这样 WGCNA 就会帮我们找出那些“表达量越高，病人越容易死”的恶性基因模块！
+trait_num <- my_cohort$clinical_data$OS_status 
+
+# 运行 WGCNA
+wgcna_res <- identify_hub_modules(sub_expr, trait_vec = trait_num)
+# ------------------------------------------------------------------------------
+# 🎯 3. 提取超级靶点并构建物理因果网络 (Module 1)
+# ------------------------------------------------------------------------------
+message("\n>>> [网络推断] 正在提取核心靶点并构建 GENIE3 因果网络...")
+
+# 提取 WGCNA 算出来的 Top 100 核心基因
+top_100_hubs <- head(wgcna_res$best_genes, 100)
+
+# 默认选排名第一的 Hub 基因作为我们要干预的“超级靶点”
+top_target <- top_100_hubs[1] 
+message(sprintf(">>> [系统决断] 锁定超级靶点: [%s]", top_target))
+
+# 把这 100 个基因的表达矩阵抠出来，喂给 GENIE3 算因果调控关系
+focus_mat <- as.matrix(sub_expr[, top_100_hubs, drop = FALSE])
+net_raw <- infer_causal_network(focus_mat)
+
+# DPI 数据处理不等式：剔除虚假的间接调控边
+net_clean <- prune_network_dpi_fast(net_raw$clean_matrix, dpi_threshold = 0.5)
+
+# 网络归一化 (为下一步的随机游走 RWR 算法做准备)
+rownames(net_clean) <- colnames(focus_mat)
+colnames(net_clean) <- colnames(focus_mat)
+W_norm <- sweep(t(net_clean), 2, colSums(t(net_clean)) + 1e-9, FUN="/")
+
+# ------------------------------------------------------------------------------
+# 💊 4. 队列级批量虚拟干预 (Module 2)
+# ------------------------------------------------------------------------------
+message(sprintf("\n>>> [虚拟干预] 即将对全队列执行 [%s] 的拓扑级虚拟敲除...", top_target))
+
+ko_results <- batch_virtual_knockout(
+  expr_matrix  = focus_mat, 
+  pheno_vec    = my_cohort$pheno_vector,
+  target_pheno = my_cohort$target_pheno, 
+  target_genes = top_target, 
+  adj_matrix   = W_norm,
+  method       = "shift" 
+)
+
+# ------------------------------------------------------------------------------
+# 🧠 5. AI 多维表型评估 (挂载 UCSC 真实生存数据！)
+# ------------------------------------------------------------------------------
+message("\n>>> [AI 评估] 启动评估引擎 (已解锁层 4 生存分析模块)...")
+
+# 以靶基因 WT 表达量的中位数，给病人划分基础的高低风险组
+baseline_labels <- ifelse(ko_results$WT[, top_target] > median(ko_results$WT[, top_target]), 
+                          "HighRisk", "LowRisk")
+
+# 🚨 终极核武器：直接把 my_cohort$clinical_data 传进去！
+report <- predict_ko_phenotype(
+  WT_matrix     = t(ko_results$WT), 
+  KO_matrix     = t(ko_results$KO), 
+  pheno_labels  = baseline_labels, 
+  target_pheno  = "HighRisk",
+  ko_gene       = top_target,
+  clinical_data = my_cohort$clinical_data,  # 无缝衔接的 Xena 生存数据
+  time_unit     = "month"
+)
+
+# ------------------------------------------------------------------------------
+# 🎨 6. 视觉大满贯：一键生成核心转化医学证据链
+# ------------------------------------------------------------------------------
+message("\n>>> 🎨 正在渲染核心神图...")
+
+# 图 1：AI 签名偏移图 (看宏观免疫/恶性通路的逆转)
+p1 <- plot_ko_delta(report, top_n = 15, color_by = "category")
+print(p1)
+
+# 图 2：多基因风险评分漂移密度图 (看死亡风险是否整体下降)
+p2 <- plot_risk_score_shift(report)
+print(p2)
+
+# 图 3：预后特征 Cox 森林图 (看哪些通路独立影响了生存)
+p3 <- plot_cox_forest(report, top_n = 10)
+print(p3)
+
+# 图 4：终极 KM 生存曲线对比 (看敲除后能给病人续命多少个月！)
+p4 <- plot_km_comparison(report, show_table = TRUE)
+print(p4)
+
+message("🎉 全链路推演完成！请在右下角 Plots 面板查看生存获益图表！")
+
+# 3. 终极 AI 评估：直接把 cohort 里的 clinical_data 传进去！
+report <- predict_ko_phenotype(
+  WT_matrix     = t(ko_results$WT), 
+  KO_matrix     = t(ko_results$KO), 
+  pheno_labels  = baseline_labels, 
+  target_pheno  = "HighRisk",
+  ko_gene       = top_target,
+  clinical_data = my_cohort$clinical_data,  # 🚨 极其优雅，再也不用手动拼表了！
+  time_unit     = "month"
+)
+# ==============================================================================
+# ==============================================================================
+# 🌟 满血版 WGCNA (为了画出华丽的聚类树)
+# ==============================================================================
+message("\n>>> 正在提取 Top 3000 高变基因，准备生成高分辨率 WGCNA 树...")
+
+# 🚨 核心修改：把 n_features 放大到 3000 (标准生信发文配置)
+sub_expr_large <- select_advanced_features(my_cohort$expr_matrix, n_features = 3000)
+
+# 重新运行 WGCNA
+wgcna_res_large <- identify_hub_modules(sub_expr_large, trait_vec = my_cohort$clinical_data$OS_status)
+
+# ── 重新绘制华丽版图 8 ──
+power <- 9  # 沿用之前的最佳软阈值
+adjacency <- WGCNA::adjacency(sub_expr_large, power = power, type = "unsigned")
+TOM <- WGCNA::TOMsimilarity(adjacency, TOMType = "unsigned")
+dissTOM <- 1 - TOM
+
+geneTree <- hclust(as.dist(dissTOM), method = "average")
+module_colors <- WGCNA::labels2colors(wgcna_res_large$module_labels)
+
+par(mar = c(1, 4, 3, 1), cex = 0.9) 
+WGCNA::plotDendroAndColors(
+  dendro = geneTree, 
+  colors = module_colors,
+  groupLabels = "Module colors",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE, 
+  guideHang = 0.05,
+  main = "High-Resolution Gene dendrogram and module colors"
+)
+
+# ------------------------------------------------------------------------------
+# 往下的代码完全不变！因为我们只取前 100 个喂给网络，算力不会崩！
+# ------------------------------------------------------------------------------
+top_100_hubs <- head(wgcna_res_large$best_genes, 100)
+top_target <- top_100_hubs[1] 
+
+# focus_mat <- as.matrix(sub_expr_large[, top_100_hubs, drop = FALSE])
+# net_raw <- infer_causal_network(focus_mat)
+# ... 继续往下跑 ...
