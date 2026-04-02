@@ -21,23 +21,16 @@ infer_causal_network <- function(expr_matrix,
                                  sd_multiplier = 3,
                                  n_cores = 1) {
 
-  # 1. 输入检查与格式转换 (GENIE3 要求行是基因，列是样本)
   if(is.null(colnames(expr_matrix))) stop("表达矩阵必须包含基因名 (colnames)！")
   message(">> 正在启动 GENIE3 核心推断算法，请稍候...")
 
-  # 强制转置以符合 GENIE3 输入要求
   genie3_input <- t(as.matrix(expr_matrix))
 
-  # 2. 运行 GENIE3
-  # 注意：在描述文件 DESCRIPTION 里声明了 Imports: GENIE3 后，
-  # 这里建议使用 GENIE3:: 前缀调用，更为严谨。
   raw_weight_matrix <- GENIE3::GENIE3(genie3_input, nCores = n_cores)
 
-  # 3. 提取有效权重并计算动态阈值
   all_weights <- as.vector(raw_weight_matrix)
   valid_weights <- all_weights[all_weights > 0]
 
-  # 处理如果没有有效权重的情况
   if(length(valid_weights) == 0) stop("GENIE3 未能推断出任何有效连线。")
 
   if (threshold_method == "top_quantile") {
@@ -50,16 +43,13 @@ infer_causal_network <- function(expr_matrix,
     stop("threshold_method 参数错误！请选择 'top_quantile' 或 'mean_sd'。")
   }
 
-  # 4. 矩阵清洗去噪
   clean_weight_matrix <- raw_weight_matrix
   clean_weight_matrix[clean_weight_matrix < final_threshold] <- 0
 
-  # 5. 统计网络拓扑信息
   total_edges <- length(valid_weights)
   retained_edges <- sum(clean_weight_matrix > 0)
   message(paste(">> 网络修剪完成！保留了", retained_edges, "条有效连线，剔除了", total_edges - retained_edges, "条噪音连线。"))
 
-  # 返回结果对象
   return(list(
     clean_matrix = clean_weight_matrix,
     threshold_used = final_threshold,

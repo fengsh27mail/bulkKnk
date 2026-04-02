@@ -1,5 +1,4 @@
-*.gz
-*.tsv
-*.csv
-*.RData
-.Rhistory
+.DS_Store
+README.html
+.Rproj.user/
+v0.5.0*
