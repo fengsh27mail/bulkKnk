@@ -1,105 +1,164 @@
-# bulkKnk (v0.5.0) 🧬
+# bulkKnk (v0.5.0) 🧬：A Universal, Data-Driven Virtual Perturbation & Phenotype Reversal Platform for Bulk RNA-seq
+## 📖 简介 (Introduction)
 
-**A Universal, Data-Driven Virtual Perturbation & Phenotype Reversal Platform for Bulk RNA-seq**
 
-`bulkKnk` 是一个面向**全物种、全疾病模型**的系统生物学工具箱。
+`bulkKnk` 是一个面向全物种、全疾病模型的系统生物学工具箱。
 它将加权基因共表达网络 (WGCNA)、因果网络推断 (GENIE3 + ARACNE) 与机器学习 (Random Forest) 深度融合，
 旨在从常规的 Bulk RNA-seq 数据中：
-1. **数据驱动地**发现核心枢纽基因 (Hub Genes)。
-2. **在硅 (in silico) 模拟**对这些靶点进行基因敲除/干预后的全网转录组稳态漂移。
-3. **多维预测**干预操作带来的表型逆转概率与通路活性改变。
 
-无论是人类肿瘤微环境重塑、小鼠发育阻滞挽救，还是植物抗逆性通路的调控，
-`bulkKnk` 都能提供从“靶点发现”到“疗效预演”的端到端解决方案。
+数据驱动地发现核心枢纽基因 (Hub Genes)。
 
----
+In silico模拟对这些靶点进行基因敲除/干预后的全网转录组稳态漂移。
 
-## 🌟 核心特性 (Core Features)
+多维预测干预操作带来的表型逆转概率与通路活性改变（以及人类患者的生存获益）。
 
-- **🌍 物种与疾病无关 (Species & Disease Agnostic)**：完全基于数据驱动的无监督/半监督算法，支持自定义任意物种的生物学通路签名 (Signatures)。
-- **🛡️ 智能特征锁定 (Smart Feature Selection)**：自动识别并“保送”关键通路基因，辅以高变基因 (HVGs) 补齐，确保信号捕捉不遗漏。
-- **🕸️ 高精度因果网络 (ARACNE-Pruned Network)**：利用数据处理不等式 (DPI) 净化 GENIE3 产生的间接调控噪音，构建精准的有向物理网络。
-- **💥 虚拟扰动引擎 (Virtual RWR Engine)**：通过改进的带重启随机游走算法，模拟单靶点或多靶点联合物理敲除后的级联反应。
-- **🤖 AI 预言家 (AI Phenotype Predictor)**：内置随机森林分类器，量化评估敲除后的样本是否成功向“健康/敏感/低风险”表型发生逆转。
+无论是人类肿瘤微环境重塑、小鼠发育阻滞挽救，还是植物抗逆性通路的调控，bulkKnk 都能提供从“靶点发现”到“疗效预演”的端到端解决方案。
+🌟 核心特性 (Core Features)
+🌍 物种与疾病无关 (Species & Disease Agnostic)：完全基于数据驱动的无监督/半监督算法，支持自定义任意物种的生物学通路签名 (Signatures)。
 
----
+🛡️ 智能特征锁定 (Smart Feature Selection)：自动识别并“保送”关键通路基因，辅以高变基因 (HVGs) 补齐，确保信号捕捉不遗漏。
 
-## 📦 安装 (Installation)
+🕸️ 高精度因果网络 (ARACNE-Pruned Network)：利用数据处理不等式 (DPI) 净化 GENIE3 产生的间接调控噪音，构建精准的有向物理网络。
 
-你可以通过 R 控制台安装开发版本：
+💥 虚拟扰动引擎 (Virtual RWR Engine)：通过改进的带重启随机游走算法，模拟单靶点或多靶点联合物理敲除后的级联反应。
 
-```R
-```R
+🤖 AI 预言家 (AI Phenotype Predictor)：内置随机森林分类器，量化评估敲除后的样本是否成功向“健康/敏感/低风险”表型发生逆转。
+
+## 安装Installation：你可以通过 R 控制台安装开发版本：
+
+`bulkKnk` could be installed from Github.
+
+```{r Github install, eval = FALSE}
 if (!require("devtools")) install.packages("devtools")
-devtools::install_github("fengsh27mail/bulkKnk") # 请替换为实际仓库地址
+devtools::install_github("fengsh27mail/bulkKnk")
+```
 
-#快速开始 (Quick Start)
-#以下展示如何使用 bulkKnk 跑通一个标准的**“表型干预预演”**工作流。
+##🚀 快速开始 (Quick Start)
+1. 准备输入数据 (Input Data)：
+`bulkKnk` 支持两种数据输入方式：内置演示数据：我们预装了精简版的 TCGA-STAD (胃癌) 表达矩阵与生存数据，方便你快速跑通流程。
+2.UCSC Xena 对接：我们强烈推荐用户从 UCSC Xena 下载标准化的测序队列。
 
-#(注：示例使用内置的 tcga_stad_mini 数据集，但该流程完美适用于任何包含 expr_matrix 和表型分组的转录组数据。)
+```{r, message=FALSE, warning=FALSE}
+library(bulkKnk)
 
-library(bulkKnk)#加载包
-data("tcga_stad_mini")#加载示例数据
+# 方式 A：使用内置测试数据 (TCGA-STAD 示例)
+data("tcga_stad_demo")
+expr_matrix <- tcga_stad_demo$expr
+clinical_data <- tcga_stad_demo$clinical
 
-# 0. 数据准备：定义你的“目标干预群” (例如: Tumor, Mutant, Treated)
-target_group <- "Tumor" 
-pheno_vector <- tcga_stad_mini$pheno_data$SampleType
+# 方式 B：一键接驳 UCSC Xena 原始数据 (推荐)
+# my_cohort <- import_xena_cohort(expr_file = "LUAD_fpkm.tsv.gz", surv_file = "LUAD_surv.tsv")
+# expr_matrix <- my_cohort$expr_matrix
+# clinical_data <- my_cohort$clinical_data
+```
 
-# 1. 智能特征构建 (自动保留关键通路基因 + 高变基因)
-sub_expr <- select_advanced_features(tcga_stad_mini$expr_matrix, n_features = 500)
+### Run 
 
-# 2. 靶点发现：识别与目标表型最相关的 WGCNA 模块
-trait_num <- as.numeric(as.factor(pheno_vector))
-wgcna_res <- identify_hub_modules(sub_expr, trait_vec = trait_num)
-focus_genes <- wgcna_res$best_genes
-top_target <- wgcna_res$hub_genes[1] # 自动提取网络核心度最高的基因作为敲除靶点
+#2. 识别致病核心模块 (Identify Hub Modules)
+#利用 WGCNA 算法，从数千个基因中锁定与患者“死亡状态”最相关的基因模块。
 
-# 3. 构建并净化局部因果网络
-net_raw <- infer_causal_network(sub_expr[, focus_genes])
-net_clean <- prune_network_dpi_fast(net_raw$clean_matrix) # DPI 净化去噪
+```{r}
+# 提取 Top 3000 高变基因
+sub_expr <- select_advanced_features(expr_matrix, n_features = 3000)
+
+# 寻找与生存状态 (OS_status) 最相关的模块
+wgcna_res <- identify_hub_modules(sub_expr, trait_vec = clinical_data$OS_status)
+
+# 锁定模块内排名第一的 Hub 基因作为“干预靶点”
+top_target <- wgcna_res$best_genes[1]
+```
+
+#3. 构建因果网络与虚拟敲除 (Causal Inference & Virtual KO)
+#基于随机森林算法学习基因间的因果调控关系，并模拟靶点敲除后全转录组的拓扑偏移。
+
+```{r}
+# 提取核心基因子集 (Top 100)
+focus_mat <- as.matrix(sub_expr[, head(wgcna_res$best_genes, 100)])
+
+# 推断调控网络并执行 DPI 剪枝
+net_clean <- prune_network_dpi_fast(infer_causal_network(focus_mat)$clean_matrix)
 W_norm <- sweep(t(net_clean), 2, colSums(t(net_clean)) + 1e-9, FUN="/")
 
-# 4. 执行群体级虚拟敲除 (仅对目标群体施加干预)
+# 实施全队列虚拟敲除
 ko_results <- batch_virtual_knockout(
-  expr_matrix  = sub_expr[, focus_genes], 
-  pheno_vec    = pheno_vector,
-  target_pheno = target_group, 
-  target_genes = top_target,  # 敲除 WGCNA 算出的 Top Hub
-  adj_matrix   = W_norm
+  expr_matrix  = focus_mat, 
+  target_genes = top_target, 
+  adj_matrix   = W_norm,
+  target_pheno = "Tumor"
 )
+```
 
-# 5. AI 表型逆转评估
-# 使用核心基因的中位数，将目标群体划分为 "High_Risk" 和 "Low_Risk" 基线
-baseline_labels <- ifelse(ko_results$WT[, top_target] > median(ko_results$WT[, top_target]), 
-                          "High_Risk", "Low_Risk")
+#4. 评估生存获益与可视化 (Evaluation & Plots)
+#这是最激动人心的步骤：观测敲除该基因后，病人的生存曲线是否发生了显著的上移（获益）。  
 
-# 支持传入用户自定义的物种专属基因集 (可选)
-my_custom_pathways <- list(
-  My_Metabolism = c("GeneA", "GeneB", "GeneC"),
-  My_Stress_Response = c("GeneX", "GeneY", "GeneZ")
-)
-
+```{r}
+# 综合 AI 评估
 report <- predict_ko_phenotype(
-  WT_matrix         = t(ko_results$WT), 
-  KO_matrix         = t(ko_results$KO), 
-  pheno_labels      = baseline_labels, 
-  target_pheno      = "High_Risk",
-  ko_gene           = top_target,
-  custom_signatures = my_custom_pathways # 非人类物种强烈建议传入此参数
+  WT_matrix     = t(ko_results$WT), 
+  KO_matrix     = t(ko_results$KO), 
+  ko_gene       = top_target,
+  clinical_data = clinical_data
 )
 
-# 6. 可视化干预带来的全网特征改变
-plot_ko_delta(report, color_by = "direction")
+# 绘制图 1：敲除前后的 KM 生存曲线对比 (续命曲线)
+plot_km_comparison(report, show_table = TRUE)
 
+# 图 2：多维特征偏移分布图
+plot_ko_delta(report)
+```
 
-#进阶用法：如何适配非人类物种数据？
-#bulkKnk 的网络推断和敲除引擎是完全数学化的，无需任何修改。
-#对于步骤 5 中的 predict_ko_phenotype，
-#由于内置签名库 (ssGSEA Signatures) 主要是人类 HGNC 基因符号，
-#如果是小鼠、斑马鱼或拟南芥数据，请务必通过 custom_signatures 参数传入你的自定义通路列表
-#（例如从 KEGG/GO 导出的目标物种基因集），AI 引擎将自动使用你的自定义通路进行机器学习分类和预测。
-#引用 (Citation)
-#如果你在科学研究中使用了 bulkKnk，请引用：
+### Visualization核心可视化展示
+#本包提供了一系列 SCI 级别的绘图函数，包括：WGCNA 模块热图、基因聚类树、Cox #森林图以及风险评分漂移图，帮助你完整构建靶点发现的证据链。
 
-#Bioinformatics Night-Shift Hero (shuofeng MUST). (2026). bulkKnk: A Data-Driven Virtual Perturbation Platform for Universal Bulk RNA-seq. 
-GitHub：fengsh27mail
+```{r, fig.height = 4.5}
+# 【图 2】真实与虚拟双重火山图 (Dual Volcano)
+message(">> 正在绘制 图2: 虚拟敲除火山图...")
+p2 <- plot_dual_volcano(
+  real_deg_df  = NULL, 
+  WT_matrix    = ko_results$WT, 
+  KO_matrix    = ko_results$KO, 
+  target_genes = top_target
+)
+print(p2)
+
+# 【图 3】GO 级联富集气泡图 (Enrichment Dotplot)
+message(">> 正在绘制 图3: 级联通路 GO 富集图...")
+wt_mean <- colMeans(ko_results$WT)
+ko_mean <- colMeans(ko_results$KO)
+log2fc <- log2((ko_mean + 0.1) / (wt_mean + 0.1))
+# 挑选被敲除波及（变化 > 0.05）的下游基因
+virtual_degs <- setdiff(names(log2fc)[abs(log2fc) > 0.05], top_target)
+
+if(length(virtual_degs) > 0) {
+  go_res <- run_vk_enrichment(virtual_degs, species = "human", database = "GO")
+  if(!is.null(go_res) && nrow(go_res) > 0) {
+    p3 <- clusterProfiler::dotplot(go_res, title = paste("GO Enrichment after", top_target, "KO"))
+    print(p3)
+  }
+}
+
+# 【图 4】风险评分漂移密度图 (Risk Score Shift)
+message(">> 正在绘制 图4: 风险评分漂移密度图...")
+p4 <- plot_risk_score_shift(report)
+print(p4)
+
+# 【图 5】预后签名 Cox 森林图 (Prognostic Forest)
+message(">> 正在绘制 图5: 预后特征 Cox 森林图...")
+p5 <- plot_cox_forest(report, top_n = 10)
+print(p5)
+
+# 【图 6】虚拟生存获益 KM 曲线对比 (KM Survival Comparison)
+message(">> 正在绘制 图6: 虚拟敲除 KM 生存对比图...")
+p6 <- plot_km_comparison(report, show_table = TRUE)
+print(p6)
+```
+#💡 进阶用法：如何适配非人类物种数据？
+`bulkKnk`的网络推断和敲除引擎是完全数学化的，无需任何修改。
+对于步骤 5 中的 predict_ko_phenotype，由于内置签名库 (ssGSEA Signatures) 主要是人类 HGNC 基因符号，如果是小鼠、斑马鱼或拟南芥数据，请务必通过 custom_signatures 参数传入你的自定义通路列表（例如从 KEGG/GO 导出的目标物种基因集），AI 引擎将自动使用你的自定义通路进行机器学习分类和预测。
+#📧 联系与致谢 (Contact)
+#本包由 生信夜班侠 (WeChat Official Account: 生信夜班侠) 开发维护。如果您在研究中使用了本工具，请引用本项目地址。
+#欢迎通过 GitHub Issues 提交反馈。
+#shuofeng Macau university of science and technology. bulkKnk: A Data-Driven Virtual Perturbation Platform for Universal Bulk RNA-seq.
+
+#GitHub: fengsh27mail/bulkKnk
+

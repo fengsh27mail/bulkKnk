@@ -1,0 +1,12 @@
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.path = "man/figures/README-",
+  out.width = "100%"
+)
+bulkKnk: 基于 Bulk RNA-seq 的靶点发现与虚拟干预推演引擎 <img src="man/figures/logo.png" align="right" height="139" />
+📖 简介 (Introduction)
+bulkKnk 是一款专为转化医学与系统生物学设计的 R 语言分析框架。传统生信分析往往止步于“寻找差异基因”或“预测预后”，而 bulkKnk 致力于在电脑中模拟真实的生物学干预：如果我们在全转录组网络中敲除某个核心靶点，患者的免疫微环境、肿瘤恶性程度以及最终的生存期（OS）将如何改变？
+
+通过整合高分辨率 WGCNA、GENIE3 因果网络推断、多维特征评分（ssGSEA）以及 AI 驱动的预后模型，bulkKnk 为研究者提供了一套从“队列数据”到“干预模拟”，再到“临床获益评估”的完整大满贯流水线。

@@ -34,11 +34,12 @@ devtools::install_github("fengsh27mail/bulkKnk")
 ```
 
 ##🚀 快速开始 (Quick Start)
+
 1. 准备输入数据 (Input Data)：
 `bulkKnk` 支持两种数据输入方式：内置演示数据：我们预装了精简版的 TCGA-STAD (胃癌) 表达矩阵与生存数据，方便你快速跑通流程。
 2.UCSC Xena 对接：我们强烈推荐用户从 UCSC Xena 下载标准化的测序队列。
 
-```{r, message=FALSE, warning=FALSE}
+```{r, eval = FALSE}
 library(bulkKnk)
 
 # 方式 A：使用内置测试数据 (TCGA-STAD 示例)
@@ -57,7 +58,7 @@ clinical_data <- tcga_stad_demo$clinical
 #2. 识别致病核心模块 (Identify Hub Modules)
 #利用 WGCNA 算法，从数千个基因中锁定与患者“死亡状态”最相关的基因模块。
 
-```{r}
+```{r,eval = FALSE}
 # 提取 Top 3000 高变基因
 sub_expr <- select_advanced_features(expr_matrix, n_features = 3000)
 
@@ -71,7 +72,7 @@ top_target <- wgcna_res$best_genes[1]
 #3. 构建因果网络与虚拟敲除 (Causal Inference & Virtual KO)
 #基于随机森林算法学习基因间的因果调控关系，并模拟靶点敲除后全转录组的拓扑偏移。
 
-```{r}
+```{r,eval = FALSE}
 # 提取核心基因子集 (Top 100)
 focus_mat <- as.matrix(sub_expr[, head(wgcna_res$best_genes, 100)])
 
@@ -91,7 +92,7 @@ ko_results <- batch_virtual_knockout(
 #4. 评估生存获益与可视化 (Evaluation & Plots)
 #这是最激动人心的步骤：观测敲除该基因后，病人的生存曲线是否发生了显著的上移（获益）。  
 
-```{r}
+```{r,eval = FALSE}
 # 综合 AI 评估
 report <- predict_ko_phenotype(
   WT_matrix     = t(ko_results$WT), 
@@ -110,7 +111,7 @@ plot_ko_delta(report)
 ### Visualization核心可视化展示
 #本包提供了一系列 SCI 级别的绘图函数，包括：WGCNA 模块热图、基因聚类树、Cox #森林图以及风险评分漂移图，帮助你完整构建靶点发现的证据链。
 
-```{r, fig.height = 4.5}
+```{r, eval = FALSE}
 # 【图 2】真实与虚拟双重火山图 (Dual Volcano)
 message(">> 正在绘制 图2: 虚拟敲除火山图...")
 p2 <- plot_dual_volcano(
