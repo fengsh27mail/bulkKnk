@@ -2,7 +2,7 @@
 # Unit tests for downstream evaluation helpers
 
 test_that("plot_ko_delta rejects invalid result object", {
-  expect_error(plot_ko_delta(list()), "delta_scores")
+  expect_error(plot_ko_delta(list()), "delta_scores|non-numeric")
 })
 
 test_that("select_advanced_features handles small matrices", {

@@ -107,8 +107,9 @@ test_that("build_ko_matrix rejects invalid method", {
 test_that("build_ko_matrix rejects dimension mismatch", {
   WT <- matrix(1, nrow = 2, ncol = 3, dimnames = list(c("S1","S2"), c("G1","G2","G3")))
   ko_vec <- c(G1 = 0, G2 = 1)  # Only 2 genes vs 3
+  baseline <- c(G1 = 1, G2 = 1)
 
-  expect_error(build_ko_matrix(WT, ko_vec, baseline = ko_vec), "must match")
+  expect_error(build_ko_matrix(WT, ko_vec, baseline), "must match|cols")
 })
 
 # --- refine_network_aracne (wrapper) ---

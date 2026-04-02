@@ -16,7 +16,7 @@ test_that(".ssgsea_score returns correct dimensions", {
 
   scores <- bulkKnk:::.ssgsea_score(expr_mat, gene_sets)
 
-  expect_s3_class(scores, "matrix")
+  expect_true(is.matrix(scores))
   expect_equal(nrow(scores), 2)   # 2 gene sets
   expect_equal(ncol(scores), 3)   # 3 samples
   expect_true(all(rownames(scores) == c("set1", "set2")))
