@@ -1,6 +1,6 @@
 Package: bulkKnk
 Title: In Silico Virtual Knockout Engine for Bulk RNA-seq Cohorts
-Version: 0.2.0
+Version: 0.6.0
 Authors@R: 
     person(given = "生信夜班侠",
            email = "admin@yida-alliance.org",
