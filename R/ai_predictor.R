@@ -795,13 +795,17 @@ plot_km_comparison <- function(result,
     .survminer_km <- function(km_df, plot_title) {
       # 🚨 修复：将 Surv() 直接写在公式里，防止 survminer 环境迷失
       km_fit   <- survival::survfit(survival::Surv(OS_time, OS_status) ~ Risk_Group, data = km_df)
+      n_strata <- length(unique(km_df$Risk_Group))
+      # Handle single-stratum case (all samples in one risk group after KO)
+      labs <- if (n_strata == 1) unique(km_df$Risk_Group) else c("High Risk", "Low Risk")
+      pal  <- if (n_strata == 1) palette[1] else palette
       survminer::ggsurvplot(
         km_fit, data = km_df,
-        palette        = palette,
-        pval           = TRUE,
-        risk.table     = show_table,
+        palette        = pal,
+        pval           = n_strata > 1,
+        risk.table     = show_table && n_strata > 1,
         conf.int       = TRUE,
-        legend.labs    = c("High Risk", "Low Risk"),
+        legend.labs    = labs,
         legend.title   = "Risk Group",
         xlab           = paste0("Time (", t_unit, ")"),
         ylab           = "Overall Survival Probability",

@@ -85,31 +85,43 @@ prune_network_dpi_fast <- function(weight_matrix, dpi_threshold = 0.5) {
 #' @export
 build_ko_matrix <- function(WT_matrix, ko_vector, WT_baseline, method = "shift") {
 
-  # 【修复】先检查长度
+  if (!is.matrix(WT_matrix)) stop("WT_matrix must be a matrix.")
   if (ncol(WT_matrix) != length(ko_vector))
-    stop("WT_matrix 的列数（基因数）必须与 ko_vector 长度一致！")
+    stop(sprintf("WT_matrix cols (%d) must match ko_vector length (%d).",
+         ncol(WT_matrix), length(ko_vector)))
 
-  # 【修复】用名称对齐替代严格顺序检查，防止中间排序操作导致的静默错误
+  # Align by gene names
   common_genes <- intersect(colnames(WT_matrix), names(ko_vector))
+  if (length(common_genes) == 0)
+    stop("No common gene names between WT_matrix colnames and ko_vector names.")
+
   if (length(common_genes) < ncol(WT_matrix) * 0.9)
     warning(sprintf(
-      "基因名匹配率仅 %.1f%%，请检查 WT_matrix 与 ko_vector 是否来自同一数据集！",
+      "Gene name overlap only %.1f%%. Check data consistency.",
       length(common_genes) / ncol(WT_matrix) * 100
     ))
 
-  # 统一按 WT_matrix 的列顺序对齐，避免顺序不一致导致的错误
+  # Align by WT_matrix column order
   ko_vector   <- ko_vector[colnames(WT_matrix)]
   WT_baseline <- WT_baseline[colnames(WT_matrix)]
+
+  # Handle NAs from misaligned names
+  na_ko <- is.na(ko_vector)
+  if (any(na_ko)) {
+    warning(sprintf("%d genes have NA ko_vector values, filling with WT baseline.", sum(na_ko)))
+    ko_vector[na_ko] <- WT_baseline[na_ko]
+  }
 
   if (method == "shift") {
     delta <- ko_vector - WT_baseline
     KO_matrix <- sweep(WT_matrix, 2, delta, FUN = "+")
     KO_matrix[KO_matrix < 0] <- 0
   } else if (method == "replace") {
-    KO_matrix <- matrix(rep(ko_vector, nrow(WT_matrix)), nrow = nrow(WT_matrix), byrow = TRUE,
+    KO_matrix <- matrix(rep(ko_vector, nrow(WT_matrix)),
+                        nrow = nrow(WT_matrix), byrow = TRUE,
                         dimnames = list(rownames(WT_matrix), names(ko_vector)))
   } else {
-    stop("method 参数错误。")
+    stop("method must be 'shift' or 'replace'.")
   }
   return(KO_matrix)
 }

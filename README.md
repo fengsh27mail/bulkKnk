@@ -1,4 +1,4 @@
-# bulkKnk (v0.5.0) 🧬：A Universal, Data-Driven Virtual Perturbation & Phenotype Reversal Platform for Bulk RNA-seq
+# bulkKnk (v0.6.0) 🧬：A Universal, Data-Driven Virtual Perturbation & Phenotype Reversal Platform for Bulk RNA-seq
 ## 📖 简介 (Introduction)
 
 

@@ -116,16 +116,15 @@ run_vk_enrichment <- function(virtual_degs, species = "human", custom_orgDb = NU
       pAdjustMethod = "BH",
       pvalueCutoff  = 0.05,
       qvalueCutoff  = 0.2,
-      readable      = TRUE  # 自动将 ENTREZID 转换回可读的 SYMBOL
+      readable      = TRUE
     )
 
   } else if (toupper(database) == "KEGG") {
-    # KEGG 需要特定的物种缩写代号
     kegg_org <- switch(tolower(species),
                        "human" = "hsa",
                        "mouse" = "mmu",
                        "rat"   = "rno",
-                       "hsa") # 默认给 hsa
+                       "hsa")
 
     message(paste(">> [Enrichment] 正在联网获取最新 KEGG 数据，物种代号:", kegg_org))
     res <- clusterProfiler::enrichKEGG(
@@ -135,7 +134,6 @@ run_vk_enrichment <- function(virtual_degs, species = "human", custom_orgDb = NU
       pvalueCutoff  = 0.05
     )
 
-    # 将 KEGG 结果中的 ENTREZID 转换回 SYMBOL，方便用户画图和阅读
     if (!is.null(res) && nrow(res) > 0) {
       res <- clusterProfiler::setReadable(res, OrgDb = org_db_name, keyType="ENTREZID")
     }
